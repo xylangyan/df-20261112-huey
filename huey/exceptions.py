@@ -4,6 +4,22 @@ class TaskLockedException(HueyException): pass
 class ResultTimeout(HueyException): pass
 class TaskTimeout(HueyException): pass
 
+
+class InvalidPayloadError(HueyException):
+    """
+    Raised when a task payload cannot be decoded by the configured payload
+    codec, e.g. it carries an unknown payload version or does not match any
+    recognized payload format. The raw data is preserved on the exception so
+    the offending record can be identified and routed to a dead-letter store.
+    """
+    def __init__(self, message, data=None, version=None, task_id=None,
+                 task_name=None):
+        self.data = data
+        self.version = version
+        self.task_id = task_id
+        self.task_name = task_name
+        super(InvalidPayloadError, self).__init__(message)
+
 class RateLimitExceeded(HueyException):
     def __init__(self, key, delay, retry=True):
         self.key, self.delay, self.retry = key, delay, retry

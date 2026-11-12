@@ -33,6 +33,7 @@ except ImportError:
     psycopg = None
 
 from huey.constants import EmptyData
+from huey.constants import INVALID_PAYLOAD_PREFIX
 from huey.exceptions import ConfigurationError
 from huey.utils import FileLock
 
@@ -296,6 +297,42 @@ class BaseStorage(object):
         """
         raise NotImplementedError
 
+    def store_invalid(self, key, value):
+        """
+        Move a task record that could not be decoded out of the queue or
+        schedule into the key/value store using a reserved key prefix, so the
+        bad record can be inspected or replayed later. The default
+        implementation reuses :meth:`put_data` and therefore works with every
+        storage backend.
+
+        :param str key: unique key (the ``huey.invalid.`` prefix is added).
+        :param bytes value: the raw, un-decoded record.
+        :return: No return value.
+        """
+        self.put_data(INVALID_PAYLOAD_PREFIX + key, value)
+
+    def invalid_items(self):
+        """
+        :return: Dict of ``{key: raw record}`` for dead-lettered payloads. Keys
+            include the reserved ``huey.invalid.`` prefix.
+        """
+        return {key: value for key, value in self.result_items().items()
+                if key.startswith(INVALID_PAYLOAD_PREFIX)}
+
+    def delete_invalid(self, key):
+        """
+        Remove a dead-lettered payload.
+
+        :param str key: the key returned by :meth:`invalid_items`.
+        :return: Boolean indicating whether a record was removed.
+        """
+        if not key.startswith(INVALID_PAYLOAD_PREFIX):
+            key = INVALID_PAYLOAD_PREFIX + key
+        return self.delete_data(key)
+
+    def invalid_count(self):
+        return len(self.invalid_items())
+
     def flush_all(self):
         """
         Remove all persistent or semi-persistent data.
@@ -330,6 +367,9 @@ class BlackHoleStorage(BaseStorage):
     def result_items(self): return {}
     def flush_results(self): pass
     def flush_counters(self): pass
+    def store_invalid(self, key, value): pass
+    def invalid_items(self): return {}
+    def delete_invalid(self, key): return False
 
 
 class MemoryStorage(BaseStorage):

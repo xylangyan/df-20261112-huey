@@ -3,6 +3,14 @@ Changelog
 
 ## Master
 
+* Add opt-in versioned task payloads. Consumers read both the legacy
+  un-versioned format and versioned payloads (``payload_versions``) so they
+  can be upgraded before producers switch to writing a version
+  (``payload_version``). Unknown versions and unrecognized shapes raise
+  ``InvalidPayloadError`` and are moved to a dead-letter store exposed by
+  ``Huey.invalid_payloads()`` instead of blocking the queue. See
+  `docs/payload-migration.rst` for the rollout and rollback procedure.
+
 [View commits](https://github.com/coleifer/huey/compare/3.5.4...master)
 
 ## 3.5.4

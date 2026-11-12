@@ -122,6 +122,7 @@ Table of contents
    installation
    guide
    consumer
+   payload-migration
    deployment
    monitoring
    imports

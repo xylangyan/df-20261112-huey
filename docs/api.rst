@@ -231,7 +231,7 @@ Huey types
 Huey object
 -----------
 
-.. py:class:: Huey(name='huey', results=True, store_none=False, utc=True, immediate=False, serializer=None, compression=False, use_zlib=False, immediate_use_memory=True, storage_class=None, store_intermediate_errors=True, **storage_kwargs)
+.. py:class:: Huey(name='huey', results=True, store_none=False, utc=True, immediate=False, serializer=None, compression=False, use_zlib=False, immediate_use_memory=True, storage_class=None, store_intermediate_errors=True, payload_version=None, payload_versions=None, payload_codec=None, invalid_payload_handler=None, **storage_kwargs)
 
     :param str name: the name of the task queue, e.g. your application's name.
     :param bool results: whether to store task results.
@@ -255,6 +255,22 @@ Huey object
         storage backend whenever immediate-mode is enabled.
     :param storage_class: storage implementation to use, e.g.
         :py:class:`SqliteStorage`. Overrides the class's default.
+    :param int payload_version: payload version to write for newly-enqueued
+        tasks. ``None`` (the default) preserves the historical, un-versioned
+        format. Only set this once every consumer is running a release that
+        can read the new version. See :ref:`payload-migration`.
+    :param payload_versions: payload versions accepted when reading, as a
+        mapping of version to decoder, or an iterable of versions handled by
+        the built-in envelope decoder. The legacy un-versioned format is
+        always accepted.
+    :param payload_codec: custom :py:class:`PayloadCodec` instance. Cannot be
+        combined with ``payload_version`` or ``payload_versions``.
+    :param invalid_payload_handler: optional callback invoked as
+        ``handler(record, data)`` when a task payload cannot be decoded, where
+        ``record`` is an :py:class:`InvalidPayload` describing the bad record
+        and ``data`` is the raw payload. When not provided, the raw record is
+        moved to the storage's dead-letter store (see
+        :py:meth:`Huey.invalid_payloads`).
     :param storage_kwargs: arbitrary keyword arguments that will be passed to
         the storage backend for additional configuration.
 
@@ -1141,6 +1157,22 @@ Huey object
 
         :returns: the number of tasks currently in the schedule, without
             deserializing them.
+
+    .. py:method:: invalid_payloads()
+
+        :returns: a dict of ``{key: raw payload}`` for tasks that could not be
+            decoded and were moved out of the queue or schedule. Keys are
+            prefixed with ``huey.invalid.`` and include the source
+            (``queue`` or ``schedule``). Use the storage's
+            ``delete_invalid(key)`` method to remove a record, or
+            :py:meth:`Huey.deserialize_task` to retry after a codec upgrade.
+
+        Records are dead-lettered when they are consumed (dequeued or read
+        from the schedule), not when the queue is merely inspected with
+        :py:meth:`pending` or :py:meth:`scheduled`. Because they use the
+        regular key/value store, they also appear in
+        :py:meth:`all_results` and are counted by :py:meth:`result_count`,
+        and :py:meth:`flush` removes them. See :ref:`payload-migration`.
 
     .. py:method:: all_results()
 
@@ -2267,6 +2299,63 @@ Serializer
     Both the application and the consumer must use the same ``secret`` and
     ``salt``.
 
+.. _payload-versioning:
+
+Payload versioning
+------------------
+
+Huey's default task payload is the pickled :py:class:`~huey.registry.Message`
+namedtuple with no explicit version. :py:class:`PayloadCodec` optionally wraps
+the message in a :py:class:`TaskPayload` that records a version, while always
+accepting the legacy un-versioned format. This lets consumers be upgraded
+before producers start writing the new format. See :ref:`payload-migration` for
+the rollout procedure.
+
+.. py:class:: TaskPayload(version, message)
+
+    :param int version: payload version, a positive integer.
+    :param message: a :py:class:`~huey.registry.Message` instance.
+
+    A namedtuple envelope around a task message. It is pickled as part of the
+    normal task serialization, so compression and signing continue to apply.
+
+.. py:class:: PayloadCodec(write_version=None, read_versions=None)
+
+    :param int write_version: version written by :py:meth:`~PayloadCodec.encode`.
+        ``None`` (default) writes the legacy bare message.
+    :param read_versions: versions accepted by
+        :py:meth:`~PayloadCodec.decode`, as a mapping of version to a decoder
+        callable ``decoder(payload) -> Message``, or an iterable of versions
+        handled by the built-in envelope decoder. Defaults to
+        ``{PAYLOAD_VERSION: ...}``; the legacy bare format is always accepted.
+
+    .. py:method:: encode(message)
+
+        :returns: a :py:class:`TaskPayload` when ``write_version`` is set, or
+            the bare message otherwise.
+
+    .. py:method:: decode(data)
+
+        :returns: the :py:class:`~huey.registry.Message` contained in the
+            payload.
+        :raises InvalidPayloadError: when the payload shape is not recognized
+            or its version is not among ``read_versions``. The exception
+            carries ``version``, ``task_id``, ``task_name`` and the raw
+            ``data`` when available, and the record is never passed to another
+            decoder on speculation.
+
+.. py:class:: InvalidPayload
+
+    Namedtuple describing a dead-lettered record, with fields ``key``,
+    ``source`` (``'queue'`` or ``'schedule'``), ``error``, ``version``,
+    ``task_id`` and ``task_name``. It is passed to a custom
+    ``invalid_payload_handler(record, data)``.
+
+.. py:data:: PAYLOAD_VERSION
+
+    The first explicit payload version (``1``). Pass
+    ``payload_version=PAYLOAD_VERSION`` to write it.
+
 .. _exceptions:
 
 Exceptions
@@ -2279,6 +2368,14 @@ Exceptions
 .. py:class:: ConfigurationError
 
     Raised when Huey encounters a configuration problem.
+
+.. py:class:: InvalidPayloadError(message, data=None, version=None, task_id=None, task_name=None)
+
+    Raised when a task payload cannot be decoded by the configured payload
+    codec, e.g. it carries an unknown version or an unrecognized shape. The
+    raw ``data`` and identity of the offending record are attached. The
+    consumer dead-letters the record instead of passing it to another
+    decoder. See :ref:`payload-migration`.
 
 .. py:class:: TaskLockedException
 

@@ -18,6 +18,7 @@ from huey.constants import EmptyData
 from huey.consumer import Consumer
 from huey.exceptions import CancelExecution
 from huey.exceptions import ConfigurationError
+from huey.exceptions import InvalidPayloadError
 from huey.exceptions import RateLimitExceeded
 from huey.exceptions import RETRYING_EXCEPTIONS
 from huey.exceptions import ResultTimeout
@@ -25,6 +26,8 @@ from huey.exceptions import RetryTask
 from huey.exceptions import TaskException
 from huey.exceptions import TaskLockedException
 from huey.exceptions import TaskTimeout
+from huey.payload import InvalidPayload
+from huey.payload import PayloadCodec
 from huey.registry import Registry
 from huey.serializer import Serializer
 from huey.storage import BlackHoleStorage
@@ -72,6 +75,22 @@ class Huey(object):
     :param bool use_zlib: use zlib for compression instead of gzip.
     :param bool immediate_use_memory: automatically switch to a local in-memory
         storage backend when immediate-mode is enabled.
+    :param int payload_version: payload version to write for newly-enqueued
+        tasks. ``None`` (the default) preserves the historical, un-versioned
+        format. Set this only after all consumers are running a release that
+        can read the new version.
+    :param payload_versions: payload versions accepted when reading, as a
+        mapping of version to decoder, or an iterable of versions handled by
+        the built-in envelope decoder. The legacy un-versioned format is
+        always accepted.
+    :param PayloadCodec payload_codec: custom payload codec instance. Cannot
+        be combined with ``payload_version`` or ``payload_versions``.
+    :param invalid_payload_handler: optional callback invoked as
+        ``handler(record, data)`` when a task payload cannot be decoded, where
+        ``record`` is an :py:class:`InvalidPayload` describing the bad record
+        and ``data`` is the raw payload. When not provided, the raw record is
+        moved to the storage's dead-letter store (see
+        :py:meth:`Huey.invalid_payloads`).
     :param storage_kwargs: arbitrary keyword arguments that will be passed to
         the storage backend for additional configuration.
 
@@ -95,7 +114,9 @@ class Huey(object):
     def __init__(self, name='huey', results=True, store_none=False, utc=True,
                  immediate=False, serializer=None, compression=False,
                  use_zlib=False, immediate_use_memory=True, storage_class=None,
-                 store_intermediate_errors=True, **storage_kwargs):
+                 store_intermediate_errors=True, payload_version=None,
+                 payload_versions=None, payload_codec=None,
+                 invalid_payload_handler=None, **storage_kwargs):
 
         self.name = name
         self.results = results
@@ -107,6 +128,18 @@ class Huey(object):
         if serializer is None:
             serializer = Serializer(compression, use_zlib=use_zlib)
         self.serializer = serializer
+
+        # Versioned task payloads. The codec always reads the legacy
+        # (un-versioned) format, so consumers can be upgraded before
+        # producers start writing versioned payloads.
+        if payload_codec is None:
+            payload_codec = PayloadCodec(payload_version, payload_versions)
+        elif payload_version is not None or payload_versions is not None:
+            raise ConfigurationError(
+                'payload_codec cannot be combined with payload_version or '
+                'payload_versions.')
+        self.payload_codec = payload_codec
+        self.invalid_payload_handler = invalid_payload_handler
 
         # Initialize storage.
         self.storage_kwargs = storage_kwargs
@@ -295,10 +328,21 @@ class Huey(object):
 
     def serialize_task(self, task):
         message = self._registry.create_message(task)
-        return self.serializer.serialize(message)
+        return self.serializer.serialize(self.payload_codec.encode(message))
 
     def deserialize_task(self, data):
-        message = self.serializer.deserialize(data)
+        try:
+            payload = self.serializer.deserialize(data)
+        except InvalidPayloadError:
+            raise
+        except Exception as exc:
+            # A payload that the serializer cannot read (for example one
+            # written by a different encoder) is an invalid record, not
+            # something to guess at. Keep the raw data so it can be located.
+            raise InvalidPayloadError(
+                'Unable to deserialize task payload: %s: %s' %
+                (type(exc).__name__, exc), data=data)
+        message = self.payload_codec.decode(payload)
         return self._registry.create_task(message)
 
     def enqueue(self, task):
@@ -371,9 +415,16 @@ class Huey(object):
         return results
 
     def dequeue(self):
-        data = self.storage.dequeue()
-        if data is not None:
-            return self.deserialize_task(data)
+        while True:
+            data = self.storage.dequeue()
+            if data is None:
+                return None
+            try:
+                return self.deserialize_task(data)
+            except InvalidPayloadError as exc:
+                # Move the bad record aside so it cannot block the records
+                # behind it, then keep going with the next one.
+                self._handle_invalid_payload(exc, data, 'queue')
 
     def put(self, key, data):
         return self.storage.put_data(key, self.serializer.serialize(data))
@@ -705,16 +756,55 @@ class Huey(object):
     def read_schedule(self, timestamp=None):
         if timestamp is None:
             timestamp = self._get_timestamp()
-        return self._deserialize_all(self.storage.read_schedule(timestamp))
+        return self._deserialize_all(self.storage.read_schedule(timestamp),
+                                     'schedule', destructive=True)
 
-    def _deserialize_all(self, messages):
+    def _deserialize_all(self, messages, source='queue', destructive=False):
         accum = []
         for msg in messages:
             try:
                 accum.append(self.deserialize_task(msg))
+            except InvalidPayloadError as exc:
+                if destructive:
+                    # The record has already been popped from the queue or
+                    # schedule, so move it aside for inspection.
+                    self._handle_invalid_payload(exc, msg, source)
+                else:
+                    # Non-destructive inspection: just report it. Storing a
+                    # copy here would duplicate the record on every peek.
+                    logger.error('Invalid task payload from %s '
+                                 '(version=%s, task=%s, name=%s): %s',
+                                 source, exc.version, exc.task_id,
+                                 exc.task_name, exc)
             except Exception:
                 logger.exception('Unable to deserialize task.')
         return accum
+
+    def _handle_invalid_payload(self, exc, data, source):
+        if exc.data is None:
+            exc.data = data
+        logger.error('Invalid task payload from %s (version=%s, task=%s, '
+                     'name=%s): %s', source, exc.version, exc.task_id,
+                     exc.task_name, exc)
+        record = InvalidPayload(
+            key='%s:%s' % (source, uuid.uuid4()),
+            source=source,
+            error=str(exc),
+            version=exc.version,
+            task_id=exc.task_id,
+            task_name=exc.task_name)
+        if self.invalid_payload_handler is not None:
+            self.invalid_payload_handler(record, data)
+        else:
+            self.storage.store_invalid(record.key, data)
+        return record
+
+    def invalid_payloads(self):
+        """
+        Return ``{key: raw record}`` for payloads that could not be decoded and
+        were moved out of the queue or schedule.
+        """
+        return self.storage.invalid_items()
 
     def read_periodic(self, timestamp):
         if timestamp is None:
@@ -728,13 +818,15 @@ class Huey(object):
         return task.eta is None or task.eta <= timestamp
 
     def pending(self, limit=None):
-        return self._deserialize_all(self.storage.enqueued_items(limit))
+        return self._deserialize_all(self.storage.enqueued_items(limit),
+                                     'queue', destructive=False)
 
     def pending_count(self):
         return self.storage.queue_size()
 
     def scheduled(self, limit=None):
-        return self._deserialize_all(self.storage.scheduled_items(limit))
+        return self._deserialize_all(self.storage.scheduled_items(limit),
+                                     'schedule', destructive=False)
 
     def scheduled_count(self):
         return self.storage.schedule_size()
