@@ -127,6 +127,7 @@ Table of contents
    imports
    shared_resources
    signals
+   execution_modes
    api
    contrib
    troubleshooting

@@ -284,7 +284,9 @@ Signals and Immediate Mode
 --------------------------
 
 Signals fire in :ref:`immediate mode <immediate>` as well as when running the
-consumer. This makes it easy to test signal handlers:
+consumer. This makes it easy to test signal handlers. The small number of
+ordering differences that are expected between the two execution modes is
+documented in :ref:`execution-modes`:
 
 .. code-block:: python
 
