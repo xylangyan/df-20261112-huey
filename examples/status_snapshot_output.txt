@@ -1,0 +1,89 @@
+########## MEMORY ##########
+storage: MemoryStorage
+
+=== 1. only future tasks (queued for tomorrow morning) ===
+ * claims                 []
+ * consumer[]             none registered
+ * earliest_eta           22:53:34
+ * pending                0
+ * scheduled              3
+ * stalled                0
+
+=== 2a. worker alive, task just claimed ===
+ * claims                 ['c8134d22 by 99bb8de6 (0.0s ago)']
+ * consumer[99bb8de6]     alive, heartbeat 0.0s ago, workers ['active 0.0s ago']
+   earliest_eta           22:53:34
+   pending                0
+   scheduled              3
+   stalled                0
+
+=== 2b. same worker, task now stalled (no progress) ===
+ * claims                 ['c8134d22 by 99bb8de6 (2.5s ago)']
+ * consumer[99bb8de6]     alive, heartbeat 0.0s ago, workers ['active 2.5s ago']
+   earliest_eta           22:53:34
+   pending                0
+   scheduled              3
+ * stalled                1
+
+=== 3. consumer gone (heartbeat expired, claim orphaned) ===
+ * claims                 ['c8134d22 by 99bb8de6 (5.0s ago)']
+ * consumer[99bb8de6]     expired, heartbeat 2.5s ago, workers ['active 5.0s ago']
+   earliest_eta           22:53:34
+   pending                0
+   scheduled              3
+   stalled                1
+
+=== 3b. consumer restarted -> new instance id, old one expired ===
+   claims                 ['c8134d22 by 99bb8de6 (5.0s ago)']
+   consumer[99bb8de6]     expired, heartbeat 2.5s ago, workers ['active 5.0s ago']
+ * consumer[d33eb6c9]     alive, heartbeat 0.0s ago, workers ['idle']
+   earliest_eta           22:53:34
+   pending                0
+   scheduled              3
+   stalled                1
+
+
+########## SQLITE ##########
+storage: SqliteStorage
+
+=== 1. only future tasks (queued for tomorrow morning) ===
+ * claims                 []
+ * consumer[]             none registered
+ * earliest_eta           22:53:39
+ * pending                0
+ * scheduled              3
+ * stalled                0
+
+=== 2a. worker alive, task just claimed ===
+ * claims                 ['d908c73b by 356fa2d5 (0.0s ago)']
+ * consumer[356fa2d5]     alive, heartbeat 0.0s ago, workers ['active 0.0s ago']
+   earliest_eta           22:53:39
+   pending                0
+   scheduled              3
+   stalled                0
+
+=== 2b. same worker, task now stalled (no progress) ===
+ * claims                 ['d908c73b by 356fa2d5 (2.5s ago)']
+ * consumer[356fa2d5]     alive, heartbeat 0.0s ago, workers ['active 2.5s ago']
+   earliest_eta           22:53:39
+   pending                0
+   scheduled              3
+ * stalled                1
+
+=== 3. consumer gone (heartbeat expired, claim orphaned) ===
+ * claims                 ['d908c73b by 356fa2d5 (5.0s ago)']
+ * consumer[356fa2d5]     expired, heartbeat 2.5s ago, workers ['active 5.0s ago']
+   earliest_eta           22:53:39
+   pending                0
+   scheduled              3
+   stalled                1
+
+=== 3b. consumer restarted -> new instance id, old one expired ===
+   claims                 ['d908c73b by 356fa2d5 (5.0s ago)']
+ * consumer[0c54811c]     alive, heartbeat 0.0s ago, workers ['idle']
+   consumer[356fa2d5]     expired, heartbeat 2.5s ago, workers ['active 5.0s ago']
+   earliest_eta           22:53:39
+   pending                0
+   scheduled              3
+   stalled                1
+

@@ -1142,6 +1142,31 @@ Huey object
         :returns: the number of tasks currently in the schedule, without
             deserializing them.
 
+    .. py:method:: status(stale_after=30, stalled_after=300)
+
+        :param float stale_after: seconds without a heartbeat before a
+            consumer is reported as ``expired``.
+        :param float stalled_after: seconds a task may be claimed before it
+            is counted as stalled.
+        :returns: a read-only dict describing queue and consumer state.
+
+        The snapshot distinguishes tasks that are executable now
+        (``pending``) from tasks scheduled for the future (``scheduled``,
+        with ``earliest_eta``), and reports the consumers that have checked
+        in, the tasks currently claimed by a worker, and how many of those
+        claims are older than ``stalled_after``.
+
+        It does not read results, does not remove enqueued or scheduled
+        tasks, and does not deserialize task payloads. A task requeued for a
+        delayed retry has its claim removed, so it is counted as scheduled
+        and not as running.
+
+        Claim records live in storage and are implemented by the memory and
+        sqlite backends. Consumer heartbeats and worker activity are kept
+        in memory by the consumer.
+
+        See :ref:`monitoring` for the shape of the returned dict.
+
     .. py:method:: all_results()
 
         :returns: a dict of task-id to the serialized result data for all

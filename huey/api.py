@@ -125,6 +125,7 @@ class Huey(object):
         self._registry = Registry()
         self._signal = S.Signal()
         self._tasks_in_flight = set()
+        self._consumer_statuses = []
         self._timeout_handler = None  # This is consumer-specific.
 
     def get_task_wrapper_class(self):
@@ -726,6 +727,92 @@ class Huey(object):
         if timestamp is None:
             timestamp = self._get_timestamp()
         return task.eta is None or task.eta <= timestamp
+
+    def status(self, stale_after=30, stalled_after=300):
+        """
+        Return a small, read-only snapshot of queue and consumer state.
+
+        Unlike the count methods or the signal-based stats, this can
+        distinguish tasks that are ready to run now from tasks scheduled for
+        the future, and can show whether a consumer is alive, busy on a slow
+        task, or gone.
+
+        The snapshot does not read results or remove enqueued / scheduled
+        tasks, and does not deserialize task payloads -- staleness is judged
+        from claim timestamps and heartbeats only.
+
+        The dictionary returned contains:
+
+        * ``pending``: number of tasks that are ready to run now.
+        * ``scheduled``: number of tasks with a future ``eta``.
+        * ``results``: number of key/value pairs in the result store.
+        * ``earliest_eta``: unix timestamp of the next scheduled task, or
+          ``None``. A queue whose only tasks are scheduled for the future
+          reports ``pending`` of 0.
+        * ``consumers``: list of consumer instances with ``id``, a ``state``
+          of ``alive`` or ``expired`` (heartbeat older than ``stale_after``),
+          ``heartbeat``, ``heartbeat_age``, and ``workers``, a list of
+          ``(worker_activity, worker_age)`` pairs. Worker ages are ``None``
+          for workers that have not run yet.
+        * ``claims``: list of ``task_id``, ``instance``, ``claimed_at`` and
+          ``claimed_age`` for tasks a worker has dequeued and not finished.
+        * ``stalled``: count of claims older than ``stalled_after``.
+
+        Claims are recorded in storage by the consumer as tasks start
+        executing and removed when they finish. A task requeued for a
+        delayed retry has its claim removed, so it is counted in
+        ``scheduled`` and not in ``claims``.
+
+        :param float stale_after: seconds without a heartbeat before a
+          consumer is reported as expired.
+        :param float stalled_after: seconds a task may be claimed before it
+          is counted as stalled.
+        :return: Dictionary describing the snapshot.
+        """
+        claims, earliest_eta, counts = self.storage.snapshot()
+        now = time.time()
+
+        claim_rows = []
+        stalled = 0
+        for task_id, instance, claimed_at in claims:
+            age = now - claimed_at
+            if age > stalled_after:
+                stalled += 1
+            claim_rows.append({'task_id': task_id, 'instance': instance,
+                               'claimed_at': claimed_at, 'claimed_age': age})
+
+        consumers = []
+        for tracker in self._consumer_statuses:
+            snap = tracker.snapshot()
+            heartbeat = snap['heartbeat']
+            heartbeat_age = None if heartbeat is None else now - heartbeat
+            alive = heartbeat_age is not None and heartbeat_age <= stale_after
+            workers = []
+            for activity in snap['worker_activity']:
+                age = None if activity is None else now - activity
+                workers.append((activity, age))
+            consumers.append({
+                'id': snap['id'],
+                'state': 'alive' if alive else 'expired',
+                'heartbeat': heartbeat,
+                'heartbeat_age': heartbeat_age,
+                'workers': workers})
+
+        return {'pending': counts['pending'],
+                'scheduled': counts['scheduled'],
+                'results': counts['results'],
+                'earliest_eta': earliest_eta,
+                'consumers': consumers,
+                'claims': claim_rows,
+                'stalled': stalled}
+
+    def register_consumer(self, consumer_status):
+        """
+        Track the given consumer's status so it appears in
+        :py:meth:`Huey.status`. Called automatically by
+        :py:class:`Consumer`.
+        """
+        self._consumer_statuses.append(consumer_status)
 
     def pending(self, limit=None):
         return self._deserialize_all(self.storage.enqueued_items(limit))

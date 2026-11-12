@@ -296,6 +296,46 @@ class BaseStorage(object):
         """
         raise NotImplementedError
 
+    def claim(self, task_id, instance, ts):
+        """
+        Record that the given consumer instance has dequeued the given task
+        and begun working on it. Called by the consumer when a task starts
+        executing.
+
+        :param str task_id: Task identifier.
+        :param str instance: Consumer instance identifier.
+        :param float ts: Unix timestamp the task was claimed.
+        :return: No return value.
+        """
+        raise NotImplementedError
+
+    def unclaim(self, task_id):
+        """
+        Remove the claim record for the given task, if one exists. Called by
+        the consumer when a task reaches a terminal state, including when it
+        is requeued for a delayed retry.
+
+        :param str task_id: Task identifier.
+        :return: No return value.
+        """
+        raise NotImplementedError
+
+    def snapshot(self):
+        """
+        Read-only status snapshot. Returns a 3-tuple of:
+
+        * list of ``(task_id, instance, claimed_at)`` claim rows, ordered by
+          claim time.
+        * unix timestamp of the earliest scheduled task, or ``None``.
+        * dictionary of counts: ``pending``, ``scheduled``, ``results``.
+
+        Must not remove or mutate any data, and must not deserialize task
+        payloads.
+
+        :return: Tuple of (claims, earliest schedule timestamp, counts).
+        """
+        raise NotImplementedError
+
     def flush_all(self):
         """
         Remove all persistent or semi-persistent data.
@@ -330,6 +370,10 @@ class BlackHoleStorage(BaseStorage):
     def result_items(self): return {}
     def flush_results(self): pass
     def flush_counters(self): pass
+    def claim(self, task_id, instance, ts): pass
+    def unclaim(self, task_id): pass
+    def snapshot(self): return [], None, {'pending': 0, 'scheduled': 0,
+                                          'results': 0}
 
 
 class MemoryStorage(BaseStorage):
@@ -340,6 +384,7 @@ class MemoryStorage(BaseStorage):
         self._results = {}
         self._schedule = []
         self._counters = {}
+        self._claims = {}  # task id -> (instance, claimed-at timestamp).
         self._lock = threading.RLock()
 
     def enqueue(self, data, priority=None):
@@ -437,6 +482,31 @@ class MemoryStorage(BaseStorage):
 
     def flush_counters(self):
         self._counters = {}
+
+    def claim(self, task_id, instance, ts):
+        with self._lock:
+            self._claims[task_id] = (instance, ts)
+
+    def unclaim(self, task_id):
+        with self._lock:
+            self._claims.pop(task_id, None)
+
+    def snapshot(self):
+        with self._lock:
+            claims = sorted(
+                ((task_id, instance, ts)
+                 for task_id, (instance, ts) in self._claims.items()),
+                key=lambda row: (row[2], row[0]))
+            earliest = self._schedule[0][0].timestamp() if self._schedule \
+                else None
+            counts = {'pending': len(self._queue),
+                      'scheduled': len(self._schedule),
+                      'results': len(self._results)}
+            return claims, earliest, counts
+
+    def flush_all(self):
+        super(MemoryStorage, self).flush_all()
+        self._claims.clear()
 
 
 # A custom lua script to pass to redis that will read tasks from the schedule
@@ -870,8 +940,12 @@ class SqliteStorage(BaseSqlStorage):
                      'queue text not null, key text not null, '
                      'value integer not null default 0, '
                      'primary key(queue, key))')
+    table_claim = ('create table if not exists claim ('
+                   'queue text not null, task_id text not null, '
+                   'instance text not null, claimed_at real not null, '
+                   'primary key(queue, task_id))')
     ddl = [table_kv, table_sched, index_sched, table_task, index_task,
-           table_counter, drop_index_task]
+           table_counter, drop_index_task, table_claim]
 
     def __init__(self, name='huey', filename='huey.db', cache_mb=8,
                  fsync=None, journal_mode='wal', timeout=5, strict_fifo=False,
@@ -1075,6 +1149,41 @@ class SqliteStorage(BaseSqlStorage):
 
     def flush_counters(self):
         self.sql('delete from counter where queue=?', (self.name,), True)
+
+    def claim(self, task_id, instance, ts):
+        self.sql('insert into claim (queue, task_id, instance, claimed_at) '
+                 'values (?, ?, ?, ?) on conflict(queue, task_id) do update '
+                 'set instance = excluded.instance, '
+                 'claimed_at = excluded.claimed_at',
+                 (self.name, task_id, instance, ts), commit=True)
+
+    def unclaim(self, task_id):
+        self.sql('delete from claim where queue = ? and task_id = ?',
+                 (self.name, task_id), commit=True)
+
+    def snapshot(self):
+        with self.db() as curs:
+            curs.execute('select task_id, instance, claimed_at from claim '
+                         'where queue = ? order by claimed_at, task_id',
+                         (self.name,))
+            claims = curs.fetchall()
+            curs.execute('select min(timestamp) from schedule where queue=?',
+                         (self.name,))
+            row = curs.fetchone()
+            earliest = row[0] if row is not None else None
+            curs.execute('select '
+                         '(select count(*) from task where queue = ?), '
+                         '(select count(*) from schedule where queue = ?), '
+                         '(select count(*) from kv where queue = ?)',
+                         (self.name, self.name, self.name))
+            pending, scheduled, results = curs.fetchone()
+        counts = {'pending': pending, 'scheduled': scheduled,
+                  'results': results}
+        return claims, earliest, counts
+
+    def flush_all(self):
+        super(SqliteStorage, self).flush_all()
+        self.sql('delete from claim where queue = ?', (self.name,), True)
 
 
 class CySqliteStorage(SqliteStorage):

@@ -14,6 +14,52 @@ Measurements
 * :py:meth:`Huey.result_count`, key/value pairs in the result store (results,
   plus revoke flags and locks).
 
+Status snapshot
+---------------
+
+Counts alone cannot tell "three tasks queued for tomorrow morning" apart
+from "three tasks a stuck worker should have run by now". For that, the
+consumer maintains a small amount of runtime state, and
+:py:meth:`Huey.status` combines it with the storage counts into a single
+read-only snapshot:
+
+.. code-block:: python
+
+    >>> huey.status()
+    {'pending': 0, 'scheduled': 3, 'results': 12,
+     'earliest_eta': 1762968552.0,
+     'consumers': [{'id': '64c03f58...', 'state': 'alive',
+                    'heartbeat': ..., 'heartbeat_age': 0.4,
+                    'workers': [(..., 0.4)]}],
+     'claims': [{'task_id': '86ca...', 'instance': '64c03f58...',
+                 'claimed_at': ..., 'claimed_age': 2.5}],
+     'stalled': 1}
+
+* ``pending`` counts only tasks that are executable *now*. Tasks pre-queued
+  for the future show up in ``scheduled`` (with ``earliest_eta``) and do not
+  inflate ``pending``.
+* Each consumer gets a fresh instance id when it starts, so a restart shows
+  up as a new entry and the previous instance's heartbeat simply expires:
+  ``state`` becomes ``expired`` once ``heartbeat_age`` exceeds
+  ``stale_after`` (default 30s).
+* ``claims`` lists tasks a worker has dequeued and not finished; a claim older
+  than ``stalled_after`` (default 300s) is counted in ``stalled``. A task
+  requeued for a delayed retry has its claim removed, so it is counted in
+  ``scheduled`` and never as both executable and running.
+
+The snapshot never reads results, never dequeues, and never deserializes
+task payloads -- staleness is judged from claim timestamps and heartbeats
+only. Claims are recorded in storage (memory and sqlite backends are
+supported), so a separate process, e.g. a web health endpoint, can read
+them. Consumer heartbeats and worker activity are in-memory and visible to
+the process that shares the ``Huey`` instance with the consumer.
+
+See ``examples/status_snapshot.py`` for a runnable demo of the three
+classic situations: only future tasks, an alive-but-slow worker, and a
+consumer that has disappeared. Each step marks the fields that changed; the
+recorded transcript for both backends is in
+``examples/status_snapshot_output.txt``.
+
 From signals, recorded in the consumer:
 
 * Per-task counts of ``SIGNAL_COMPLETE``, ``SIGNAL_ERROR`` and

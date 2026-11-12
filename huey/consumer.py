@@ -6,6 +6,7 @@ import signal
 import sys
 import threading
 import time
+import uuid
 
 import multiprocessing
 
@@ -32,6 +33,58 @@ logger = logging.getLogger('huey.consumer')
 class ConsumerStopped(Exception): pass
 
 class WorkerRecycle(Exception): pass
+
+
+class ConsumerStatus(object):
+    """
+    Tracks the runtime state of a single consumer instance so that
+    :py:meth:`Huey.status` can report what the consumer is doing.
+
+    Each consumer gets a fresh instance id, so a restarted consumer shows up
+    as a new identity and heartbeats from the previous instance expire on
+    their own. The heartbeat and worker activity timestamps are kept in
+    memory; claims (tasks dequeued and currently executing) are recorded in
+    storage so that they remain visible to other processes.
+
+    This tracker never reads task results and never deserializes task
+    payloads -- it only records identifiers and timestamps.
+    """
+    def __init__(self, huey, workers, instance_id=None):
+        self.instance_id = instance_id or uuid.uuid4().hex
+        self._storage = huey.storage
+        self._lock = threading.Lock()
+        self._worker_activity = [None] * workers
+        self.heartbeat = None
+
+    def beat(self):
+        self.heartbeat = time.time()
+
+    def worker_beat(self, idx):
+        with self._lock:
+            self._worker_activity[idx] = time.time()
+
+    def claim(self, task):
+        try:
+            self._storage.claim(task.id, self.instance_id, time.time())
+        except NotImplementedError:
+            pass
+        except Exception:
+            logger.exception('Error recording task claim.')
+
+    def unclaim(self, task):
+        try:
+            self._storage.unclaim(task.id)
+        except NotImplementedError:
+            pass
+        except Exception:
+            logger.exception('Error removing task claim.')
+
+    def snapshot(self):
+        with self._lock:
+            activity = list(self._worker_activity)
+        return {'id': self.instance_id,
+                'heartbeat': self.heartbeat,
+                'worker_activity': activity}
 
 
 class BaseProcess(object):
@@ -93,11 +146,13 @@ class Worker(BaseProcess):
     process_name = 'Worker'
 
     def __init__(self, huey, stop_flag, default_delay, max_delay, backoff,
-                 max_tasks=None):
+                 max_tasks=None, status=None, worker_index=0):
         self.delay = self.default_delay = default_delay
         self.max_delay = max_delay
         self.backoff = backoff
         self.max_tasks = max_tasks
+        self.status = status
+        self.worker_index = worker_index
         self.task_count = 0
         super(Worker, self).__init__(huey, stop_flag)
 
@@ -119,6 +174,10 @@ class Worker(BaseProcess):
 
     def loop(self, now=None):
         task = None
+        if self.status is not None:
+            # Record that this worker's loop is turning, regardless of
+            # whether there is work to do. A stalled worker stops here.
+            self.status.worker_beat(self.worker_index)
         try:
             task = self.huey.dequeue()
         except Exception:
@@ -128,11 +187,18 @@ class Worker(BaseProcess):
             if task is not None:
                 self.delay = self.default_delay
                 self.task_count += 1
+                if self.status is not None:
+                    self.status.claim(task)
                 try:
                     self.huey.execute(task, now)
                 except Exception:
                     self._logger.exception('Unhandled error during execution '
                                            'of task %s.', task.id)
+                finally:
+                    # Covers completion, failure, and delayed requeues: a
+                    # task scheduled for retry is no longer being worked.
+                    if self.status is not None:
+                        self.status.unclaim(task)
                 if self.max_tasks and self.task_count >= self.max_tasks:
                     self._logger.info('Worker reached max tasks (%d), '
                                       'exiting.', self.max_tasks)
@@ -448,6 +514,12 @@ class Consumer(object):
         self.huey._timeout_handler = self.environment.timeout
         self.stop_flag = self.environment.get_stop_flag()
 
+        # Status tracker for this consumer instance. A fresh instance id is
+        # generated each time a consumer is created, so a restarted consumer
+        # appears as a new identity and its previous heartbeat expires.
+        self.status = ConsumerStatus(huey, workers)
+        huey.register_consumer(self.status)
+
         # In the event the consumer was killed while running a task that held
         # a lock, this ensures that all locks are flushed before starting.
         if flush_locks or extra_locks:
@@ -461,7 +533,7 @@ class Consumer(object):
         # Create the worker process(es) (also not started yet).
         self.worker_threads = []
         for i in range(workers):
-            worker = self._create_worker()
+            worker = self._create_worker(i)
             process = self._create_process(worker, 'Worker-%d' % (i + 1))
 
             # The worker threads are stored as [(worker impl, worker_t), ...].
@@ -483,14 +555,16 @@ class Consumer(object):
         return WORKER_TO_ENVIRONMENT[worker_type](self._graceful_sig,
                                                   self._interrupt_sig)
 
-    def _create_worker(self):
+    def _create_worker(self, index=0):
         return self.worker_class(
             huey=self.huey,
             stop_flag=self.stop_flag,
             default_delay=self.default_delay,
             max_delay=self.max_delay,
             backoff=self.backoff,
-            max_tasks=self.max_tasks)
+            max_tasks=self.max_tasks,
+            status=self.status,
+            worker_index=index)
 
     def _create_scheduler(self):
         return self.scheduler_class(
@@ -625,6 +699,7 @@ class Consumer(object):
             self._logger.info('Consumer exiting.')
 
     def loop(self, health_check_ts=None):
+        self.status.beat()
         try:
             stopped = self.stop_flag.wait(timeout=self._stop_flag_timeout)
         except KeyboardInterrupt:
@@ -665,7 +740,7 @@ class Consumer(object):
         for i, (worker, worker_t) in enumerate(self.worker_threads):
             if not self.environment.is_alive(worker_t):
                 self._logger.warning('Worker %d died, restarting.', i + 1)
-                worker = self._create_worker()
+                worker = self._create_worker(i)
                 worker_t = self._create_process(worker, 'Worker-%d' % (i + 1))
                 worker_t.start()
                 restart_occurred = True

@@ -3,6 +3,10 @@ Changelog
 
 ## Master
 
+* Add `Huey.status()`, a read-only snapshot that separates executable tasks
+  from scheduled ones and reports consumer heartbeats, claims, and stalled
+  tasks. Claim tracking is implemented for the memory and sqlite storages.
+
 [View commits](https://github.com/coleifer/huey/compare/3.5.4...master)
 
 ## 3.5.4
