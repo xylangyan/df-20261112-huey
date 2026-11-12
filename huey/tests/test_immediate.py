@@ -151,6 +151,29 @@ class TestImmediate(BaseTestCase):
             [prod.s(i) for i in range(10)], agg))
         self.assertEqual(result(), 55)
 
+    def test_chord_settle(self):
+        from huey.api import SettleResult
+        from huey.utils import BranchRecord
+
+        @self.huey.task(retries=1)
+        def prod(n):
+            if n == 'fail':
+                raise ValueError('nope')
+            return n
+
+        @self.huey.task()
+        def agg(records):
+            return [(r.idx, r.status, r.value) for r in records]
+
+        result = self.huey.enqueue(group([
+            prod.s('ok'), prod.s(None), prod.s('fail')]).settle(agg))
+        self.assertTrue(isinstance(result, SettleResult))
+        records = result()
+        self.assertEqual(records[0], (0, BranchRecord.SUCCESS, 'ok'))
+        self.assertEqual(records[1], (1, BranchRecord.SUCCESS, None))
+        self.assertEqual(records[2][0], 2)
+        self.assertEqual(records[2][1], BranchRecord.FAILED)
+
     def test_chord_nested(self):
         @self.huey.task()
         def ident(v):

@@ -5,6 +5,15 @@ Changelog
 
 [View commits](https://github.com/coleifer/huey/compare/3.5.4...master)
 
+* Add an opt-in settling chord, `group.settle(callback)` /
+  `chord(tasks, callback, settle=True)`. The callback runs once after every
+  branch reaches a terminal state and receives `BranchRecord` objects that
+  preserve input order and task ID and distinguish success (including a
+  successful `None`), permanent failure and revocation. Branches still
+  retrying are not counted until they settle. Enqueueing returns a
+  `SettleResult`, a `ChordResult` subclass, so existing `Result`-based call
+  patterns continue to work.
+
 ## 3.5.4
 
 * Fix possible hang if worker holding the stop flag was killed while holding

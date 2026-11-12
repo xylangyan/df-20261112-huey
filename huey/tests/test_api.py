@@ -9,6 +9,7 @@ from huey.api import MemoryHuey
 from huey.api import PeriodicTask
 from huey.api import Result
 from huey.api import ResultGroup
+from huey.api import SettleResult
 from huey.api import Task
 from huey.api import TaskWrapper
 from huey.api import chord
@@ -25,6 +26,7 @@ from huey.exceptions import TaskLockedException
 from huey.exceptions import TaskTimeout
 from huey.serializer import SignedSerializer
 from huey.tests.base import BaseTestCase
+from huey.utils import BranchRecord
 from huey.utils import Error
 from huey.utils import SKIPPED
 
@@ -2450,6 +2452,195 @@ class TestChordPrimitive(BaseTestCase):
         self.assertEqual(self.execute_next(), -1)
         self.assertEqual(len(self.huey), 0)
         self.assertEqual(state, [99])
+
+
+class TestSettleChord(BaseTestCase):
+    def test_settle_records_order_ids_and_statuses(self):
+        # Three local branches: the later-submitted branch completes first,
+        # branch 0 fails once then succeeds on retry, branch 1 is revoked.
+        # The settlement callback must run exactly once and receive records
+        # in input order, carrying each branch's task id and terminal status.
+        seen = []
+        attempts = {'flaky': 0}
+
+        @self.huey.task()
+        def aggregate(records):
+            seen.append(records)
+            return [(r.idx, r.task_id, r.status, r.value) for r in records]
+
+        @self.huey.task(retries=1)
+        def flaky(n):
+            attempts['flaky'] += 1
+            if attempts['flaky'] == 1:
+                raise TestError('nope')
+            return n + 1
+
+        @self.huey.task()
+        def prod(n):
+            return n + 1
+
+        g = group([
+            flaky.s(1),                 # idx 0: fails, then succeeds -> 2.
+            prod.s(2, priority=5),      # idx 1: revoked.
+            prod.s(3, priority=10),     # idx 2: higher priority, runs first.
+        ])
+        result = self.huey.enqueue(g.settle(aggregate))
+
+        self.assertTrue(isinstance(result, SettleResult))
+        self.assertTrue(isinstance(result, ChordResult))
+        self.assertEqual(len(result.results), 3)
+
+        # Revoke branch 1 before anything runs.
+        list(result.results)[1].revoke()
+
+        # First attempt of branch 2 (later-submitted, highest priority).
+        self.assertEqual(self.execute_next(), 4)
+        self.assertEqual(seen, [])
+
+        # Revoked branch reports a terminal record; still no settlement.
+        self.assertTrue(self.execute_next() is None)
+        self.assertEqual(seen, [])
+        self.assertEqual(len(self.huey), 1)  # Branch 0 only.
+
+        # Branch 0 fails on its first attempt and is re-enqueued for retry;
+        # a still-retrying branch must not be counted towards settlement.
+        self.assertTrue(self.execute_next() is None)
+        self.assertEqual(seen, [])
+        self.assertEqual(len(self.huey), 1)  # Branch 0 retry only.
+
+        # Branch 0 succeeds on retry; now every branch has a terminal state.
+        self.assertEqual(self.execute_next(), 2)
+        self.assertEqual(len(self.huey), 1)  # Settlement callback.
+
+        task_ids = [r.task.id for r in result.results]
+        self.assertEqual(self.execute_next(),
+                         [(0, task_ids[0], BranchRecord.SUCCESS, 2),
+                          (1, task_ids[1], BranchRecord.REVOKED, None),
+                          (2, task_ids[2], BranchRecord.SUCCESS, 4)])
+
+        # Settlement callback ran exactly once.
+        self.assertEqual(len(seen), 1)
+        records = seen[0]
+        self.assertEqual(len(records), 3)
+        self.assertEqual([r.idx for r in records], [0, 1, 2])
+        self.assertEqual([r.task_id for r in records], task_ids)
+        self.assertEqual([r.status for r in records],
+                         [BranchRecord.SUCCESS, BranchRecord.REVOKED,
+                          BranchRecord.SUCCESS])
+        self.assertEqual([r.value for r in records], [2, None, 4])
+        self.assertEqual([r.ok for r in records], [True, False, True])
+        self.assertEqual(len(self.huey), 0)
+
+        # The existing Result handles still work for executed branches.
+        self.assertEqual(result.results[0], 2)
+        self.assertEqual(result.results[2], 4)
+        self.assertEqual(result(), result.callback())
+
+        # Chord bookkeeping is cleaned up like a normal chord.
+        self.assertEqual(self.huey.storage._counters, {})
+        self.assertEqual(self.huey.result_count(), 0)
+
+    def test_settle_empty_result_is_distinguishable(self):
+        @self.huey.task()
+        def nothing():
+            return None
+
+        @self.huey.task()
+        def aggregate(records):
+            return [(r.status, r.value) for r in records]
+
+        result = self.huey.enqueue(group([nothing.s()]).settle(aggregate))
+        self.assertEqual(self.execute_next(), None)  # Successful None.
+        self.assertEqual(self.execute_next(),
+                         [(BranchRecord.SUCCESS, None)])
+        self.assertEqual(result(),
+                         [(BranchRecord.SUCCESS, None)])
+
+    def test_settle_final_failure_record(self):
+        @self.huey.task(retries=1)
+        def boom(n):
+            raise TestError('bad')
+
+        @self.huey.task()
+        def aggregate(records):
+            return records
+
+        result = self.huey.enqueue(group([boom.s(1)]).settle(aggregate))
+        self.assertTrue(self.execute_next() is None)  # First failure, retries.
+        self.assertEqual(len(self.huey), 1)
+        self.assertTrue(self.execute_next() is None)  # Retries exhausted.
+        self.assertEqual(len(self.huey), 1)  # Settlement callback.
+
+        records = self.execute_next()
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record.idx, 0)
+        self.assertEqual(record.task_id, list(result.results)[0].id)
+        self.assertEqual(record.status, BranchRecord.FAILED)
+        self.assertEqual(record.value['error'], 'TestError(bad)')
+        self.assertFalse(record.ok)
+        self.assertEqual(result(), records)
+
+    def test_settle_returns_records_via_chord_entry(self):
+        # Both entry points must work: chord(..., settle=True) and
+        # group.settle(callback).
+        @self.huey.task()
+        def prod(n):
+            return n * 10
+
+        @self.huey.task()
+        def aggregate(records):
+            return [(r.idx, r.status, r.value) for r in records]
+
+        result = self.huey.enqueue(
+            chord([prod.s(1), prod.s(2)], aggregate, settle=True))
+        self.assertTrue(isinstance(result, SettleResult))
+        self.assertEqual(self.execute_next(), 10)
+        self.assertEqual(self.execute_next(), 20)
+        self.assertEqual(self.execute_next(),
+                         [(0, BranchRecord.SUCCESS, 10),
+                          (1, BranchRecord.SUCCESS, 20)])
+
+    def test_settle_empty_group(self):
+        @self.huey.task()
+        def aggregate(records):
+            return len(records)
+
+        result = self.huey.enqueue(group([]).settle(aggregate))
+        self.assertTrue(isinstance(result, SettleResult))
+        self.assertEqual(self.execute_next(), 0)
+        self.assertEqual(result(), 0)
+
+    def test_settle_branch_record_picklable(self):
+        record = BranchRecord(2, 'task-id', BranchRecord.SUCCESS, {'k': 'v'})
+        self.assertEqual(pickle.loads(pickle.dumps(record)), record)
+        revoked = BranchRecord(1, 'task-id', BranchRecord.REVOKED)
+        restored = pickle.loads(pickle.dumps(revoked))
+        self.assertEqual(restored.status, BranchRecord.REVOKED)
+        self.assertIsNone(restored.value)
+
+    def test_plain_chord_unchanged(self):
+        # The default path still passes raw results (including SKIPPED and
+        # Error) and returns a plain ChordResult.
+        @self.huey.task(retries=1)
+        def prod(n):
+            if n is None:
+                raise TestError('bad')
+            return n + 1
+
+        @self.huey.task()
+        def aggregate(ns):
+            return ns
+
+        result = self.huey.enqueue(
+            chord([prod.s(1), prod.s(None)], aggregate))
+        self.assertTrue(type(result) is ChordResult)
+        list(result.results)[1].revoke()
+        self.assertEqual(self.execute_next(), 2)
+        self.assertTrue(self.execute_next() is None)  # Revoked.
+        values = self.execute_next()
+        self.assertEqual(values[0], 2)
+        self.assertTrue(values[1] is SKIPPED)
 
 
 class TestTaskChaining(BaseTestCase):

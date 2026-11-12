@@ -1243,6 +1243,69 @@ Enqueueing a :py:class:`chord` returns a :py:class:`ChordResult`:
     result.pipeline_results  # ResultGroup for [index_pages, send_report]
 
 
+Settling chords - wait for terminal states
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A regular chord callback receives raw member results, so a missing result,
+a successful ``None``, a permanent failure and a revoked member are hard to
+tell apart without inspecting the result store. When a workflow needs to
+decide *why* a branch produced no value, use ``group.settle()`` (or
+``chord(..., settle=True)``) instead of ``then()``::
+
+    from huey import BranchRecord
+
+    @huey.task()
+    def fetch(source):
+        return requests.get(source).json()  # May legitimately return None.
+
+    @huey.task()
+    def reconcile(records):
+        missing = [r for r in records if r.status != BranchRecord.SUCCESS]
+        values = [r.value for r in records if r.ok]
+        ...
+
+    result = huey.enqueue(
+        group([fetch.s(src) for src in sources])
+        .settle(reconcile))
+
+The callback is enqueued once, after **every** branch has reached a terminal
+state, and receives a list of :py:class:`BranchRecord` objects in the same
+order as the input list. Each record has:
+
+* ``idx`` - the branch's position in the input list.
+* ``task_id`` - the ID of the task that represents the branch.
+* ``status`` - one of ``BranchRecord.SUCCESS``, ``BranchRecord.FAILED`` or
+  ``BranchRecord.REVOKED``.
+* ``value`` - the return value for ``SUCCESS`` (including a legitimate
+  ``None``), the error metadata dict for ``FAILED``, and ``None`` for
+  ``REVOKED``.
+
+A branch that still has retries pending is **not** reported: it only
+contributes a record once it succeeds or exhausts its retries, so the
+callback is not invoked prematurely. The order branches finish in does not
+matter; records are always ordered by input position.
+
+Enqueueing a settling chord returns a :py:class:`SettleResult`, which is a
+:py:class:`ChordResult` subclass. Existing call patterns continue to work:
+
+.. code-block:: python
+
+    result = huey.enqueue(group([fetch.s(u) for u in urls]).settle(reconcile))
+    result()                  # Result of reconcile (callback).
+    result.results[0]         # Result handle for the first branch.
+    result.callback           # Result handle for the callback.
+    result.pipeline_results   # Results of tasks chained after the callback.
+
+The branch ``Result`` handles are unchanged, so code that reads per-branch
+values keeps working as before.
+
+.. note::
+    ``huey.SKIPPED`` is still passed to regular chord callbacks; settling
+    chords replace it with a ``REVOKED`` record. A branch that is revoked,
+    expires, or is cancelled by a pre-execute hook is reported as
+    ``REVOKED``, while a branch that exhausts its retries is ``FAILED``.
+
+
 Composing groups and chords
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

@@ -74,7 +74,8 @@ class Registry(object):
                 task.chord_config.cid,
                 task.chord_config.size,
                 task.chord_config.idx,
-                self.create_message(task.chord_config.callback))
+                self.create_message(task.chord_config.callback),
+                task.chord_config.settle)
 
         return Message(
             task.id,
@@ -106,9 +107,12 @@ class Registry(object):
 
         chord_config = None
         if message.chord_config is not None:
-            cid, size, idx, cb_ser = message.chord_config
+            # Older messages carry a 4-tuple without the settle flag.
+            cid, size, idx, cb_ser = message.chord_config[:4]
+            settle = (message.chord_config[4]
+                      if len(message.chord_config) > 4 else False)
             callback = self.create_task(cb_ser)
-            chord_config = ChordConfig(cid, size, idx, callback)
+            chord_config = ChordConfig(cid, size, idx, callback, settle)
 
         return TaskClass(
             message.args,

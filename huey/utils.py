@@ -33,7 +33,54 @@ class _Skipped(object):
 
 SKIPPED = _Skipped()
 
-ChordConfig = namedtuple('ChordConfig', ('cid', 'size', 'idx', 'callback'))
+ChordConfig = namedtuple('ChordConfig', ('cid', 'size', 'idx', 'callback',
+                                         'settle'))
+ChordConfig.__new__.__defaults__ = (False,)
+
+
+class BranchRecord(object):
+    """
+    Terminal-state record for a single branch of a settling chord. Unlike the
+    raw branch result (which is indistinguishable from a not-yet-finished
+    branch when missing or ``None``), a record always carries an explicit
+    status.
+    """
+    SUCCESS = 'success'
+    FAILED = 'failed'
+    REVOKED = 'revoked'
+
+    __slots__ = ('idx', 'task_id', 'status', 'value')
+
+    def __init__(self, idx, task_id, status, value=None):
+        self.idx = idx
+        self.task_id = task_id
+        self.status = status
+        self.value = value
+
+    @property
+    def ok(self):
+        return self.status == self.SUCCESS
+
+    def __repr__(self):
+        return ('BranchRecord(idx=%s, task_id=%s, status=%s, value=%r)' %
+                (self.idx, self.task_id, self.status, self.value))
+
+    def __eq__(self, rhs):
+        if not isinstance(rhs, BranchRecord):
+            return NotImplemented
+        return (self.idx == rhs.idx and self.task_id == rhs.task_id and
+                self.status == rhs.status and self.value == rhs.value)
+
+    def __ne__(self, rhs):
+        result = self.__eq__(rhs)
+        return result if result is NotImplemented else not result
+
+    def __getstate__(self):
+        return dict((slot, getattr(self, slot)) for slot in self.__slots__)
+
+    def __setstate__(self, state):
+        for slot, value in state.items():
+            setattr(self, slot, value)
 
 
 def load_class(s):

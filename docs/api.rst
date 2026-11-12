@@ -1714,6 +1714,28 @@ Huey object
                 group([fetch.s(u) for u in urls])
                 .then(aggregate))
 
+    .. py:method:: settle(task, *args, **kwargs)
+
+        :param task: A ``task()``-decorated function (:py:class:`TaskWrapper`),
+            or a :py:class:`Task` instance to run once every member has
+            reached a terminal state.
+        :param args: Arguments to pass to the callback task.
+        :param kwargs: Keyword arguments to pass to the callback task.
+        :returns: A :py:class:`chord` instance with ``settle=True``.
+
+        Like :py:meth:`~group.then`, but the callback is enqueued only after
+        every member has reached a terminal state and receives a list of
+        :py:class:`BranchRecord` objects instead of raw results. This makes it
+        possible to distinguish a successful ``None`` from a permanent
+        failure or a revoked member. Members that still have retries pending
+        are not counted until they succeed or exhaust their retries.
+
+        .. code-block:: python
+
+            result = huey.enqueue(
+                group([fetch.s(u) for u in urls])
+                .settle(reconcile))
+
     .. py:method:: error(task, *args, **kwargs)
 
         :param task: A ``task()``-decorated function (:py:class:`TaskWrapper`).
@@ -1734,7 +1756,7 @@ Huey object
                 .error(on_fetch_error)
                 .then(aggregate))
 
-.. py:class:: chord(tasks, callback)
+.. py:class:: chord(tasks, callback, settle=False)
 
     A :py:class:`chord` consists of a group of tasks that execute in parallel
     and a callback task. When all sub-tasks have completed (or permanently
@@ -1746,6 +1768,11 @@ Huey object
     :param callback: a ``task()``-decorated function (:py:class:`TaskWrapper`),
         or a :py:class:`Task` instance. The callback receives the list of
         sub-task results as its first argument.
+    :param bool settle: when ``True``, the callback is enqueued only after
+        every member has reached a terminal state and receives a list of
+        :py:class:`BranchRecord` objects instead of raw results. See
+        :py:meth:`group.settle` and :ref:`groups-and-chords` in the guide.
+        Enqueueing returns a :py:class:`SettleResult`.
 
     .. code-block:: python
 
@@ -1924,6 +1951,46 @@ Huey object
 
         Reset the callback result and allow re-fetching a new result for the
         given task (i.e. after a task error and subsequent retry).
+
+
+.. py:class:: SettleResult(results, callback_result, pipeline=None)
+
+    Subclass of :py:class:`ChordResult` returned when enqueueing a settling
+    chord (``group.settle()`` or ``chord(..., settle=True)``). All
+    :py:class:`ChordResult` attributes and methods work identically, including
+    the per-branch :py:class:`Result` handles on ``results``; the difference
+    is that the callback receives a list of :py:class:`BranchRecord` objects
+    instead of raw branch results.
+
+
+.. py:class:: BranchRecord(idx, task_id, status, value=None)
+
+    Terminal-state record for one branch of a settling chord. Import it from
+    ``huey``. Records are passed to the callback in input order.
+
+    .. py:attribute:: idx
+
+        Zero-based position of the branch in the input list.
+
+    .. py:attribute:: task_id
+
+        The ID of the task representing the branch.
+
+    .. py:attribute:: status
+
+        One of the class attributes ``BranchRecord.SUCCESS``,
+        ``BranchRecord.FAILED`` or ``BranchRecord.REVOKED``.
+
+    .. py:attribute:: value
+
+        The branch return value when the status is ``SUCCESS`` (including a
+        legitimate ``None``), the error metadata dict when ``FAILED``, and
+        ``None`` when ``REVOKED``.
+
+    .. py:method:: ok()
+
+        Property that returns ``True`` only when the status is ``SUCCESS``.
+
 
 Result
 ------

@@ -37,6 +37,7 @@ from huey.storage import PriorityRedisStorage
 from huey.storage import RedisExpireStorage
 from huey.storage import RedisStorage
 from huey.storage import SqliteStorage
+from huey.utils import BranchRecord
 from huey.utils import ChordConfig
 from huey.utils import Error
 from huey.utils import SKIPPED
@@ -327,13 +328,14 @@ class Huey(object):
     def _enqueue_chord(self, chord_obj):
         cid = str(uuid.uuid4())
         size = len(chord_obj.tasks)
+        settle = chord_obj.settle
         results = []
         for i, task in enumerate(chord_obj.tasks):
             if isinstance(task, group):
                 raise ValueError('cannot use `group` as a chord member - '
                                  'use .then() to convert to a `chord` first.')
 
-            config = ChordConfig(cid, size, i, chord_obj.callback)
+            config = ChordConfig(cid, size, i, chord_obj.callback, settle)
             results.append(self._enqueue_chord_member(task, config))
 
         if not size:
@@ -342,8 +344,12 @@ class Huey(object):
             self.enqueue(callback)
 
         pipeline = self._pipeline_results(chord_obj.callback)
-        return ChordResult(results, pipeline[0],
-                           ResultGroup(pipeline) if len(pipeline) > 1 else None)
+        callback_result = pipeline[0]
+        pipeline_results = (ResultGroup(pipeline) if len(pipeline) > 1
+                            else None)
+        if settle:
+            return SettleResult(results, callback_result, pipeline_results)
+        return ChordResult(results, callback_result, pipeline_results)
 
     def _enqueue_chord_member(self, task, config):
         if isinstance(task, chord):
@@ -518,7 +524,7 @@ class Huey(object):
                 task.on_complete.extend_data(task_value)
                 self.enqueue(task.on_complete)
             if task.chord_config is not None:
-                self._check_chord(task.chord_config, task_value)
+                self._check_chord(task.chord_config, task_value, task.id)
         else:
             final = not task.retries
             surface = final or (self.store_intermediate_errors and
@@ -547,10 +553,13 @@ class Huey(object):
         # The rest of the pipeline won't run, so report to its chord here.
         while task is not None:
             if task.chord_config is not None:
-                return self._check_chord(task.chord_config, value)
+                return self._check_chord(task.chord_config, value, task.id)
             task = task.on_complete
 
-    def _check_chord(self, cc, value):
+    def _check_chord(self, cc, value, task_id):
+        if cc.settle:
+            return self._check_chord_settle(cc, value, task_id)
+
         chord_key = 'chord:%s' % cc.cid
         result_key = 'chord:%s:%s' % (cc.cid, cc.idx)
         self.put_result(result_key, value)
@@ -567,6 +576,40 @@ class Huey(object):
 
             callback = cc.callback
             callback.extend_data((results,))
+            self.enqueue(callback)
+
+    def _check_chord_settle(self, cc, value, task_id):
+        # Every branch contributes a terminal-state record, so the callback
+        # can distinguish a successful None from a failure or a revocation.
+        # Branches still retrying do not report until they reach a terminal
+        # state.
+        if isinstance(value, Error):
+            status = BranchRecord.FAILED
+            record_value = value.metadata
+        elif value is SKIPPED:
+            status = BranchRecord.REVOKED
+            record_value = None
+        else:
+            status = BranchRecord.SUCCESS
+            record_value = value
+
+        record = BranchRecord(cc.idx, task_id, status, record_value)
+        result_key = 'chord:%s:%s' % (cc.cid, cc.idx)
+        self.put_result(result_key, record)
+
+        chord_key = 'chord:%s' % cc.cid
+        if self.storage.incr(chord_key) == cc.size:
+            self.storage.delete_counter(chord_key)
+
+            # Expiring storages implement pop_data as a peek.
+            records = []
+            for idx in range(cc.size):
+                key = 'chord:%s:%s' % (cc.cid, idx)
+                records.append(self.get(key, peek=True))
+                self.delete(key)
+
+            callback = cc.callback
+            callback.extend_data((records,))
             self.enqueue(callback)
 
     def _requeue_task(self, task, timestamp, retry_eta=None):
@@ -1162,6 +1205,9 @@ class group(object):
     def then(self, task, *args, **kwargs):
         return chord(self.tasks, _signature(task, args, kwargs))
 
+    def settle(self, task, *args, **kwargs):
+        return chord(self.tasks, _signature(task, args, kwargs), settle=True)
+
     def error(self, *args, **kwargs):
         for task in self.tasks:
             task.error(*args, **kwargs)
@@ -1169,9 +1215,10 @@ class group(object):
 
 
 class chord(object):
-    def __init__(self, tasks, callback):
+    def __init__(self, tasks, callback, settle=False):
         self.tasks = tasks
         self.callback = _signature(callback)
+        self.settle = settle
 
     def then(self, task, *args, **kwargs):
         self.callback.then(task, *args, **kwargs)
@@ -1345,6 +1392,17 @@ class ChordResult(object):
 
     def reset(self):
         self.callback.reset()
+
+
+class SettleResult(ChordResult):
+    """
+    Returned when enqueueing a settling chord (``group.settle()`` or
+    ``chord(..., settle=True)``). Behaves exactly like
+    :py:class:`ChordResult`: the branch ``Result`` handles remain available via
+    ``.results`` and the callback result via ``.get()``. The distinction is
+    that the callback receives a list of :py:class:`BranchRecord` objects
+    instead of raw branch results.
+    """
 
 
 dash_re = re.compile(r'(\d+)-(\d+)(?:/(\d+))?')
