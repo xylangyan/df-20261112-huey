@@ -40,6 +40,7 @@ from huey.storage import SqliteStorage
 from huey.utils import ChordConfig
 from huey.utils import Error
 from huey.utils import SKIPPED
+from huey.utils import Window
 from huey.utils import noop_context
 from huey.utils import normalize_expire_time
 from huey.utils import normalize_time
@@ -414,7 +415,14 @@ class Huey(object):
         if timestamp is None:
             timestamp = self._get_timestamp()
 
-        if not self.ready_to_run(task, timestamp):
+        if self.is_window_sealed(task.window):
+            # Sealed window generations are stopped in place, regardless of
+            # whether the task is due yet -- they are not re-scheduled.
+            logger.info('Task %s belongs to sealed window %s, not executing.',
+                        task.id, task.window)
+            self._emit(S.SIGNAL_WINDOW_SEALED, task)
+            self._abort_chord_member(task, SKIPPED)
+        elif not self.ready_to_run(task, timestamp):
             self.add_schedule(task)
         elif self.is_revoked(task, timestamp, False):
             logger.warning('Task %s was revoked, not executing', task)
@@ -515,8 +523,16 @@ class Huey(object):
             self._run_post_execute(task, task_value, exception)
             self._emit(S.SIGNAL_COMPLETE, task)
             if task.on_complete:
-                task.on_complete.extend_data(task_value)
-                self.enqueue(task.on_complete)
+                # A task that was running when its window was sealed may
+                # finish, but must not schedule the next pipeline step.
+                if self.is_window_sealed(task.window):
+                    logger.info('Task %s finished but window %s is sealed, '
+                                'not enqueueing next step.', task.id,
+                                task.window)
+                    self._emit(S.SIGNAL_WINDOW_SEALED, task)
+                else:
+                    task.on_complete.extend_data(task_value)
+                    self.enqueue(task.on_complete)
             if task.chord_config is not None:
                 self._check_chord(task.chord_config, task_value)
         else:
@@ -531,12 +547,24 @@ class Huey(object):
                     next_task = next_task.on_complete if final else None
             self._run_post_execute(task, task_value, exception)
             if surface and task.on_error:
-                # Copy, as on_error is shared across retries.
-                handler = copy.copy(task.on_error)
-                handler.extend_data(exception)
-                self.enqueue(handler)
+                if self.is_window_sealed(task.window):
+                    logger.info('Task %s errored but window %s is sealed, not '
+                                'enqueueing error handler.', task.id,
+                                task.window)
+                    self._emit(S.SIGNAL_WINDOW_SEALED, task)
+                else:
+                    # Copy, as on_error is shared across retries.
+                    handler = copy.copy(task.on_error)
+                    handler.extend_data(exception)
+                    self.enqueue(handler)
             if final:
                 self._abort_chord_member(task, error)
+            elif self.is_window_sealed(task.window):
+                # A task that was running when its window was sealed may
+                # finish, but must not be requeued for another attempt.
+                logger.info('Task %s failed but window %s is sealed, not '
+                            'requeueing.', task.id, task.window)
+                self._emit(S.SIGNAL_WINDOW_SEALED, task)
             else:
                 self._emit(S.SIGNAL_RETRYING, task)
                 self._requeue_task(task, self._get_timestamp(), retry_eta)
@@ -648,6 +676,72 @@ class Huey(object):
 
     def restore_by_id(self, id):
         return self.restore(Task(id=id))
+
+    def _window_key(self, name):
+        return 'w:%s' % name
+
+    def _window_state(self, name):
+        # Returns the persisted window state dict, or None if the window has
+        # never been opened. State is stored in the KV store so it survives
+        # restarts of the storage backend (e.g. SqliteHuey).
+        return self.get(self._window_key(name), peek=True)
+
+    def _put_window_state(self, name, state):
+        self.put(self._window_key(name), state)
+
+    def open_window(self, name):
+        """
+        Open (or reopen) a collection window, returning a :py:class:`Window`
+        marker that can be attached to tasks. Reopening a window that was
+        previously sealed starts a new generation, so tasks and late results
+        from the sealed generation are never mixed into the new one.
+        """
+        state = self._window_state(name)
+        generation = state['generation'] + 1 if state is not None else 1
+        state = {'generation': generation, 'sealed': False}
+        self._put_window_state(name, state)
+        return Window(name, generation)
+
+    def seal_window(self, name):
+        """
+        Seal the current generation of the named collection window. Tasks
+        belonging to this generation that have not started will not be
+        executed. Tasks already running may finish, but will not re-enqueue
+        follow-up work (pipeline steps or retries). Returns the sealed
+        :py:class:`Window`, or None if the window was never opened.
+        """
+        state = self._window_state(name)
+        if state is None:
+            return None
+        state['sealed'] = True
+        self._put_window_state(name, state)
+        return Window(name, state['generation'])
+
+    def window_status(self, name):
+        """
+        Return a dict describing the named window: the current generation and
+        whether that generation is sealed. Returns None if the window has
+        never been opened.
+        """
+        state = self._window_state(name)
+        if state is not None:
+            return dict(state)
+
+    def is_window_sealed(self, window):
+        """
+        Check whether the given :py:class:`Window` marker refers to a sealed
+        generation. A window is treated as sealed when its generation was
+        explicitly sealed, or when a newer generation has since been opened
+        under the same name.
+        """
+        if window is None:
+            return False
+        if not isinstance(window, Window):
+            window = Window(*window)
+        state = self._window_state(window.name)
+        if state is None:
+            return False
+        return state['sealed'] or window.generation < state['generation']
 
     def _check_revoked(self, data, timestamp=None, peek=True):
         """
@@ -803,7 +897,8 @@ class Task(object):
     def __init__(self, args=None, kwargs=None, id=None, eta=None, retries=None,
                  retry_delay=None, priority=None, expires=None,
                  on_complete=None, on_error=None, expires_resolved=None,
-                 timeout=None, chord_config=None, retry_backoff=None):
+                 timeout=None, chord_config=None, retry_backoff=None,
+                 window=None):
         self.name = type(self).__name__
         self.args = () if args is None else args
         self.kwargs = {} if kwargs is None else kwargs
@@ -822,6 +917,11 @@ class Task(object):
         self.timeout = timeout if timeout is not None else self.default_timeout
         self.chord_config = chord_config
         self._deadline = None
+
+        # Optional collection-window marker. When the window generation the
+        # task belongs to is sealed, the task will not be started and any
+        # follow-up work (pipeline steps, retries) will not be re-enqueued.
+        self.window = window
 
         self.on_complete = on_complete
         self.on_error = on_error
@@ -851,6 +951,8 @@ class Task(object):
             rep += ', on error %s' % self.on_error
         if self.chord_config:
             rep += ', chord %s' % self.chord_config.cid
+        if self.window:
+            rep += ' window=%s' % (self.window,)
         return rep
 
     def __hash__(self):
@@ -897,6 +999,10 @@ class Task(object):
             self.on_complete.then(task, *args, **kwargs)
         else:
             self.on_complete = _signature(task, args, kwargs)
+            # A window-tagged pipeline is sealed as a unit: propagate the
+            # window marker to the next step unless it has its own.
+            if self.window is not None and self.on_complete.window is None:
+                self.on_complete.window = self.window
         return self
 
     def error(self, task, *args, **kwargs):
@@ -998,7 +1104,8 @@ class TaskWrapper(object):
 
     def schedule(self, args=None, kwargs=None, eta=None, delay=None,
                  priority=None, retries=None, retry_delay=None,
-                 retry_backoff=None, expires=None, timeout=None, id=None):
+                 retry_backoff=None, expires=None, timeout=None, id=None,
+                 window=None):
         if eta is None and delay is None:
             if isinstance(args, (int, float)):
                 delay = args
@@ -1024,7 +1131,8 @@ class TaskWrapper(object):
             retry_backoff=retry_backoff,
             priority=priority,
             expires=expires,
-            timeout=timeout)
+            timeout=timeout,
+            window=window)
         return self.huey.enqueue(task)
 
     def _apply(self, it):
@@ -1057,7 +1165,8 @@ class TaskWrapper(object):
                                retry_backoff=kwargs.pop('retry_backoff', None),
                                priority=kwargs.pop('priority', None),
                                expires=kwargs.pop('expires', None),
-                               timeout=kwargs.pop('timeout', None))
+                               timeout=kwargs.pop('timeout', None),
+                               window=kwargs.pop('window', None))
 
 
 class TaskLock(object):
@@ -1298,7 +1407,8 @@ class Result(object):
             timeout=self.task.timeout,
             chord_config=self.task.chord_config,
             on_complete=on_complete,
-            on_error=on_error)
+            on_error=on_error,
+            window=self.task.window)
         return self.huey.enqueue(task)
 
     def reset(self):

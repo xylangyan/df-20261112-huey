@@ -724,6 +724,67 @@ execution of the task:
 
     >>> send_notification_emails.revoke(revoke_once=True)
 
+Sealing collection windows
+--------------------------
+
+Revoking a task only prevents that one message from executing -- a delayed
+retry sitting in the schedule can still bring the work back later. When a
+whole batch of work needs to be abandoned (for example a backfill whose
+source files were rolled back), tasks can instead be tagged with a named
+*collection window*, and the window's current *generation* can be sealed by
+an operator.
+
+Open a window and attach its marker to tasks:
+
+.. code-block:: python
+
+    window = huey.open_window('history-backfill')  # -> Window('history-backfill', 1)
+
+    # Attach the marker to individual tasks...
+    collect_batch.s(1, window=window)()
+
+    # ...or to scheduled tasks. Pipeline steps created with .then() inherit
+    # the marker, so a window-tagged pipeline is sealed as a unit.
+    collect_batch.s(2, window=window).then(persist_batch)()
+
+Sealing the window stops the current generation:
+
+* tasks that have not started will not be executed -- including delayed
+  retries still sitting in the schedule. They are dropped in place and emit
+  the ``window-sealed`` signal.
+* tasks that are already running may finish (their result is stored), but
+  they will not enqueue follow-up work: no pipeline ``on_complete`` steps,
+  no ``on_error`` handlers, and no retries.
+
+.. code-block:: python
+
+    huey.seal_window('history-backfill')
+    huey.is_window_sealed(window)  # -> True
+
+Reopening the same window name starts a *new generation*. Tasks and late
+results from the sealed generation are never mixed into the new one:
+
+.. code-block:: python
+
+    new_window = huey.open_window('history-backfill')  # -> generation 2
+    huey.is_window_sealed(window)      # -> True (old generation)
+    huey.is_window_sealed(new_window)  # -> False
+
+    huey.window_status('history-backfill')
+    # -> {'generation': 2, 'sealed': False}
+
+Window state is stored in the key/value store, so it persists across
+restarts of the storage backend (e.g. :py:class:`SqliteHuey`). Tasks without
+a window marker are completely unaffected and follow the existing code-paths.
+
+For more information, see the following API docs:
+
+* :py:meth:`Huey.open_window` for opening a window and obtaining a marker.
+* :py:meth:`Huey.seal_window` for sealing the current generation.
+* :py:meth:`Huey.window_status` and :py:meth:`Huey.is_window_sealed` for
+  inspecting window state.
+* :py:class:`Window` for the task marker itself.
+
 Task expiration
 ---------------
 

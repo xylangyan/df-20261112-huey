@@ -864,6 +864,46 @@ Huey object
 
             For task functions, use :py:meth:`TaskWrapper.is_revoked`.
 
+    .. py:method:: open_window(name)
+
+        :param str name: the collection window name.
+        :returns: a :py:class:`Window` marker for the opened generation.
+
+        Open a named collection window. If the window was previously opened
+        and sealed, a new generation is started. Attach the returned marker to
+        tasks using the ``window`` keyword argument
+        (e.g. ``task.s(arg, window=window)``). Tasks without a marker are
+        unaffected.
+
+    .. py:method:: seal_window(name)
+
+        :param str name: the collection window name.
+        :returns: the sealed :py:class:`Window`, or ``None`` if the window was
+            never opened.
+
+        Seal the current generation of the named collection window. Tasks
+        belonging to the sealed generation that have not started will not be
+        executed -- including delayed retries still sitting in the schedule.
+        Tasks already running may finish, but will not enqueue follow-up work
+        (pipeline steps, error handlers, or retries).
+
+    .. py:method:: window_status(name)
+
+        :param str name: the collection window name.
+        :returns: a dict with ``generation`` and ``sealed`` keys, or ``None``
+            if the window was never opened.
+
+        Return the persisted state of the named collection window.
+
+    .. py:method:: is_window_sealed(window)
+
+        :param window: a :py:class:`Window` marker (or a ``(name, generation)``
+            tuple).
+        :returns: boolean indicating whether the generation is sealed.
+
+        A generation is treated as sealed when it was explicitly sealed, or
+        when a newer generation has since been opened under the same name.
+
     .. py:method:: result(id, blocking=False, timeout=None, backoff=1.15, max_delay=1.0, revoke_on_timeout=False, preserve=False)
 
         :param id: the task's unique identifier.
@@ -1393,7 +1433,7 @@ Huey object
 
 
 
-.. py:class:: Task(args=None, kwargs=None, id=None, eta=None, retries=None, retry_delay=None, priority=None, expires=None, on_complete=None, on_error=None, expires_resolved=None, timeout=None, chord_config=None, retry_backoff=None)
+.. py:class:: Task(args=None, kwargs=None, id=None, eta=None, retries=None, retry_delay=None, priority=None, expires=None, on_complete=None, on_error=None, expires_resolved=None, timeout=None, chord_config=None, retry_backoff=None, window=None)
 
     :param tuple args: arguments for the function call.
     :param dict kwargs: keyword arguments for the function call.
@@ -1418,6 +1458,20 @@ Huey object
         example.
     :param Task on_complete: Task to execute upon completion of this task.
     :param Task on_error: Task to execute upon failure / error.
+    :param Window window: optional collection-window marker. When the window
+        generation is sealed, the task will not be started and will not
+        enqueue follow-up work. See :py:meth:`Huey.seal_window`.
+
+.. py:class:: Window(name, generation)
+
+    :param str name: the collection window name.
+    :param int generation: the opening of the window, starting at 1.
+
+    Marks a task as belonging to a named collection window. Obtain a marker
+    from :py:meth:`Huey.open_window` and pass it to
+    :py:meth:`TaskWrapper.s` or :py:meth:`TaskWrapper.schedule` using the
+    ``window`` keyword argument. Pipeline steps created with
+    :py:meth:`Task.then` inherit the marker.
     :param datetime expires_resolved: absolute expiration time, set by huey
         from ``expires`` when the task is enqueued.
     :param chord_config: set by huey on members of a :py:class:`chord`.

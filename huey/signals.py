@@ -17,6 +17,7 @@ SIGNAL_INTERRUPTED = 'interrupted'
 SIGNAL_ENQUEUED = 'enqueued'
 SIGNAL_TIMEOUT = 'timeout'
 SIGNAL_RATE_LIMITED = 'rate-limited'
+SIGNAL_WINDOW_SEALED = 'window-sealed'
 
 
 class Signal(object):

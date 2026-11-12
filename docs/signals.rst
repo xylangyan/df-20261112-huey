@@ -64,6 +64,12 @@ handler beyond the standard ``(signal, task)`` pair.
    * - ``SIGNAL_RATE_LIMITED``
      - Task was rate-limited by a :py:meth:`Huey.rate_limit`.
      - None
+   * - ``SIGNAL_WINDOW_SEALED``
+     - Task belongs to a sealed collection-window generation. It is stopped
+       before execution, or it finished running while its window was being
+       sealed and its follow-up work (pipeline steps, error handlers,
+       retries) was not enqueued. See :py:meth:`Huey.seal_window`.
+     - None
    * - ``SIGNAL_INTERRUPTED``
      - Consumer was shut down while the task was still executing (e.g., via
        ``SIGTERM``).
@@ -112,6 +118,22 @@ Signals are emitted in a deterministic order.
 
 1. ``SIGNAL_ENQUEUED``
 2. ``SIGNAL_REVOKED``
+
+**Task from a sealed window generation (not started):**
+
+1. ``SIGNAL_ENQUEUED``
+2. ``SIGNAL_WINDOW_SEALED``: the task is stopped in place and is not
+   re-scheduled, even if it still had a delayed retry pending.
+
+**Task already running when its window was sealed:**
+
+1. ``SIGNAL_ENQUEUED``
+2. ``SIGNAL_EXECUTING``
+3. ``SIGNAL_COMPLETE`` (the task is allowed to finish)
+4. ``SIGNAL_WINDOW_SEALED``: the follow-up ``on_complete`` step is *not*
+   enqueued. On failure the order is ``SIGNAL_ERROR`` then
+   ``SIGNAL_WINDOW_SEALED``, and no retry or ``on_error`` handler is
+   enqueued.
 
 **Rate-limited task (with automatic retry):**
 

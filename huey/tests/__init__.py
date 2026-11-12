@@ -15,4 +15,5 @@ from huey.tests.test_sql_huey import *
 from huey.tests.test_stats import *
 from huey.tests.test_storage import *
 from huey.tests.test_utils import *
+from huey.tests.test_windows import *
 from huey.tests.test_wrappers import *

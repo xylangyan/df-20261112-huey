@@ -20,3 +20,4 @@ from huey.exceptions import CancelExecution
 from huey.exceptions import RetryTask
 from huey.utils import Error
 from huey.utils import SKIPPED
+from huey.utils import Window

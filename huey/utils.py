@@ -25,6 +25,33 @@ else:
 Error = namedtuple('Error', ('metadata',))
 
 
+class Window(namedtuple('Window', ('name', 'generation'))):
+    """
+    Marks a task as belonging to a named collection window. The generation
+    identifies which opening of the window the task was enqueued for. Reopening
+    a window with the same name starts a new generation, so tasks and late
+    results from a sealed generation are never mixed into the new one.
+    """
+    def __new__(cls, name, generation):
+        if not isinstance(name, str) or not name:
+            raise ValueError('window name must be a non-empty string')
+        generation = int(generation)
+        if generation < 1:
+            raise ValueError('window generation must be a positive integer')
+        return super(Window, cls).__new__(cls, name, generation)
+
+    def __str__(self):
+        return '%s#g%s' % (self.name, self.generation)
+
+    def __eq__(self, rhs):
+        if isinstance(rhs, Window):
+            return self.name == rhs.name and self.generation == rhs.generation
+        return NotImplemented
+
+    def __hash__(self):
+        return hash((self.name, self.generation))
+
+
 class _Skipped(object):
     def __repr__(self):
         return 'SKIPPED'

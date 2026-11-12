@@ -1,0 +1,14 @@
+Collection-window sealing demo ("历史回补" rollback scenario).
+
+Run:
+
+    python examples/windows/backfill.py
+
+The script opens two generations of the same named window using a SQLite
+backend, seals the first generation, and then lets old generation-1 work try
+to continue its next pipeline step. The output shows which tasks were stopped
+in place, which finished before the seal, and which completed in the new
+generation. Window state is read back from SQLite after the connection is
+closed and reopened.
+
+The demo uses HUEY_WINDOW_DB (default: /tmp/huey-window-demo.db).
