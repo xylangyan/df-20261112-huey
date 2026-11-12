@@ -13,6 +13,7 @@ except ImportError:
 import struct
 import threading
 import time
+import uuid
 
 try:
     import cysqlite
@@ -848,6 +849,19 @@ class BaseSqlStorage(BaseStorage):
                 return curs.fetchall()
 
 
+class ClaimedMessage(bytes):
+    """
+    Raw task data returned by a claim-mode dequeue(), with the lease metadata
+    attached. Behaves as plain bytes everywhere (serializer, compression), so
+    existing code is unaffected; the consumer reads ``.claim`` to confirm or
+    renew the lease.
+    """
+    def __new__(cls, data, claim):
+        obj = bytes.__new__(cls, bytes(data))
+        obj.claim = claim
+        return obj
+
+
 class SqliteStorage(BaseSqlStorage):
     begin_sql = 'begin exclusive'
     integrity_error = getattr(sqlite3, 'IntegrityError', None)
@@ -875,13 +889,21 @@ class SqliteStorage(BaseSqlStorage):
 
     def __init__(self, name='huey', filename='huey.db', cache_mb=8,
                  fsync=None, journal_mode='wal', timeout=5, strict_fifo=False,
-                 create_tables=True, **kwargs):
+                 create_tables=True, claim_ttl=None, clock=None, **kwargs):
         self.filename = filename
         self._cache_mb = cache_mb
         self._fsync = fsync
         self._journal_mode = journal_mode
         self._timeout = timeout  # Busy timeout in seconds, default is 5.
         self._conn_kwargs = kwargs
+
+        # Optional claim (lease) mode. When claim_ttl is set, dequeue() marks
+        # the row as claimed instead of deleting it, and the consumer must call
+        # ack() once the task has been processed. Claims expire after
+        # claim_ttl seconds, at which point another consumer may re-claim the
+        # task. The clock is injectable for testing and defaults to time.time().
+        self.claim_ttl = claim_ttl
+        self.clock = clock or time.time
 
         # By default Sqlite may reuse rowids when rows are removed. This means
         # that SqliteHuey may not strictly be a FIFO. If strict FIFO ordering
@@ -896,9 +918,33 @@ class SqliteStorage(BaseSqlStorage):
                 'primary key autoincrement')
             self.ddl = ddl
 
+        if claim_ttl is not None:
+            # Claim mode adds two nullable columns to the task table: a lease
+            # token and the lease expiry. Existing databases are migrated
+            # in-place; rows enqueued before the migration are simply
+            # unclaimed.
+            self.ddl = list(self.ddl) + [
+                'alter table task add column claim_token text',
+                'alter table task add column claim_expires real']
+
         self.to_blob = memoryview
 
         super(SqliteStorage, self).__init__(name, create_tables=create_tables)
+
+    def initialize_schema(self):
+        if self.claim_ttl is None:
+            return super(SqliteStorage, self).initialize_schema()
+
+        # The claim columns may already exist (e.g. a database created by an
+        # earlier run), so apply the ALTER TABLEs individually and ignore
+        # "duplicate column" errors.
+        with self.db(commit=True, close=True) as curs:
+            for sql in self.ddl:
+                try:
+                    curs.execute(sql)
+                except self.operational_error as exc:
+                    if 'duplicate column' not in str(exc):
+                        raise
 
     def _create_connection(self):
         conn = sqlite3.connect(self.filename, timeout=self._timeout,
@@ -933,7 +979,18 @@ class SqliteStorage(BaseSqlStorage):
         self.sql('insert into task (queue, data, priority) values (?, ?, ?)',
                  (self.name, self.to_blob(data), priority or 0), commit=True)
 
+    def _unclaimed(self):
+        # Predicate selecting rows that are either unclaimed, or whose lease
+        # has expired and can be re-claimed.
+        return ('(claim_token is null or claim_expires is null or '
+                'claim_expires <= ?)')
+
     def dequeue(self):
+        if self.claim_ttl is None:
+            return self._dequeue_delete()
+        return self._dequeue_claim()
+
+    def _dequeue_delete(self):
         # Quick check without the full exclusive lock.
         if not self.sql('select 1 from task where queue = ? limit 1',
                         (self.name,), results=True):
@@ -949,16 +1006,91 @@ class SqliteStorage(BaseSqlStorage):
                 if curs.rowcount == 1:
                     return data
 
+    def _dequeue_claim(self):
+        now = self.clock()
+        # Quick check without the full exclusive lock.
+        if not self.sql('select 1 from task where queue = ? and %s limit 1' %
+                        self._unclaimed(), (self.name, now), results=True):
+            return
+
+        with self.db(commit=True) as curs:
+            curs.execute('select id, data from task where queue = ? and %s '
+                         'order by priority desc, id limit 1' %
+                         self._unclaimed(), (self.name, now))
+            result = curs.fetchone()
+            if result is None:
+                return
+            tid, data = result
+            token = uuid.uuid4().hex
+            curs.execute('update task set claim_token = ?, claim_expires = ? '
+                         'where id = ?',
+                         (token, now + self.claim_ttl, tid))
+            if curs.rowcount == 1:
+                return self._message(data, {'id': tid, 'ack': token})
+
+    def _message(self, data, claim=None):
+        # The dequeue() contract returns raw bytes; the claim is attached to
+        # the bytes via a small wrapper that behaves as bytes everywhere.
+        return ClaimedMessage(data, claim) if claim is not None else data
+
+    def ack(self, claim):
+        # Confirm a claimed task by deleting its row. The lease token must
+        # still match: a stale consumer cannot delete a row that has since
+        # been re-claimed by another consumer.
+        if claim is None:
+            return False
+        with self.db(commit=True) as curs:
+            curs.execute('delete from task where id = ? and claim_token = ?',
+                         (claim['id'], claim['ack']))
+            return curs.rowcount == 1
+
+    def renew_claim(self, claim, ttl=None):
+        # Extend the lease on a claimed task, returning a refreshed claim (or
+        # None if the lease has already expired and the task was re-claimed).
+        if claim is None:
+            return
+        ttl = self.claim_ttl if ttl is None else ttl
+        now = self.clock()
+        with self.db(commit=True) as curs:
+            curs.execute('update task set claim_expires = ? where id = ? and '
+                         'claim_token = ? and (claim_expires is null or '
+                         'claim_expires > ?)',
+                         (now + ttl, claim['id'], claim['ack'], now))
+            if curs.rowcount == 1:
+                return dict(claim, expires=now + ttl)
+
+    def release_claim(self, claim):
+        # Give up a lease without deleting the row, so the task becomes
+        # immediately available to another consumer.
+        if claim is None:
+            return False
+        with self.db(commit=True) as curs:
+            curs.execute('update task set claim_token = null, '
+                         'claim_expires = null where id = ? and claim_token = ?',
+                         (claim['id'], claim['ack']))
+            return curs.rowcount == 1
+
     def queue_size(self):
-        return self.sql('select count(id) from task where queue=?',
-                        (self.name,), results=True)[0][0]
+        if self.claim_ttl is None:
+            sql = 'select count(id) from task where queue=?'
+            params = (self.name,)
+        else:
+            sql = ('select count(id) from task where queue=? and %s' %
+                   self._unclaimed())
+            params = (self.name, self.clock())
+        return self.sql(sql, params, results=True)[0][0]
 
     def enqueued_items(self, limit=None):
-        sql = 'select data from task where queue=? order by priority desc, id'
-        params = (self.name,)
+        if self.claim_ttl is None:
+            sql = 'select data from task where queue=? order by priority desc, id'
+            params = (self.name,)
+        else:
+            sql = ('select data from task where queue=? and %s '
+                   'order by priority desc, id' % self._unclaimed())
+            params = (self.name, self.clock())
         if limit is not None:
             sql += ' limit ?'
-            params = (self.name, limit)
+            params = params + (limit,)
 
         return [i for i, in self.sql(sql, params, results=True)]
 

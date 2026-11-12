@@ -1638,6 +1638,18 @@ Storage Options
     operational complexity of running a separate server process like Redis is
     undesirable.
 
+    By default dequeueing a task deletes its row, so a consumer that crashes
+    after dequeueing but before executing loses the task. Passing
+    ``claim_ttl=<seconds>`` enables claim (lease) mode instead: dequeueing
+    marks the row as claimed (in the same priority-then-insertion order), and
+    the consumer confirms it with :py:meth:`Huey.ack` once the task reaches a
+    final state. If the consumer dies, the lease expires and another consumer
+    re-claims the task. Retried tasks release their claim by acking the old
+    row after the retry has been safely re-enqueued (or scheduled), and
+    cancelled tasks release it by acking when the cancellation is final.
+    Long-running tasks can extend their lease with
+    :py:meth:`Huey.renew_claim`.
+
 :py:class:`CySqliteHuey`
     Same storage layout and characteristics as :py:class:`SqliteHuey`, but
     driven by `cysqlite <https://cysqlite.readthedocs.io/>`_ rather than the

@@ -133,6 +133,12 @@ Huey types
         corruption in the event of sudden power loss. By default will use the
         SQLite library's ``synchronous`` setting (typically ``1``, which
         provides a good balance between durability and performance).
+    :param float claim_ttl: enable claim (lease) mode: dequeued tasks stay in
+        the database until the consumer confirms them with :py:meth:`Huey.ack`,
+        so a consumer that dies mid-flight does not lose the task. Leases
+        expire after ``claim_ttl`` seconds and may be renewed with
+        :py:meth:`Huey.renew_claim`. Unset by default, which keeps the
+        historical delete-on-read dequeue.
 
     SqliteHuey fully supports task priorities.
 
@@ -796,6 +802,44 @@ Huey object
             automatically enqueue a task for execution. You only need to call
             :py:meth:`~Huey.enqueue` directly when working with pipelines,
             groups, or chords.
+
+    .. py:method:: ack(task)
+
+        :param task: a :py:class:`Task` previously returned by
+            :py:meth:`~Huey.dequeue`.
+        :returns: boolean indicating whether the lease was still held.
+
+        Confirm that a claimed task has been fully processed, deleting its row
+        from the queue. Only applies to storages running in claim mode (e.g.
+        ``SqliteHuey(claim_ttl=...)``); for other storages this is a no-op
+        returning ``False``. The consumer calls this automatically once a task
+        reaches a final state (success, exhausted retries, cancellation,
+        revocation, expiration) or has been safely re-enqueued for retry. A
+        ``False`` return means the lease had expired and the task may already
+        have been re-claimed by another consumer, whose row is left untouched.
+
+    .. py:method:: renew_claim(task, ttl=None)
+
+        :param task: a :py:class:`Task` previously returned by
+            :py:meth:`~Huey.dequeue`.
+        :param float ttl: lease duration in seconds, defaults to the storage's
+            ``claim_ttl``.
+        :returns: boolean indicating whether the lease was renewed.
+
+        Extend the lease on a claimed task, e.g. for long-running tasks. On
+        success ``task.ack`` is updated with the refreshed claim. Returns
+        ``False`` when the lease had already expired and the task may have
+        been re-claimed elsewhere.
+
+    .. py:method:: release_claim(task)
+
+        :param task: a :py:class:`Task` previously returned by
+            :py:meth:`~Huey.dequeue`.
+        :returns: boolean indicating whether the lease was released.
+
+        Give up the lease on a claimed task without deleting it, making the
+        task immediately available to other consumers instead of waiting for
+        the lease to expire.
 
     .. py:method:: revoke(task, revoke_until=None, revoke_once=False)
 
@@ -2429,7 +2473,7 @@ Huey comes with several built-in storage implementations:
     automatically cleaned-up.
 
 
-.. py:class:: SqliteStorage(name='huey', filename='huey.db', cache_mb=8, fsync=None, journal_mode='wal', timeout=5, strict_fifo=False, create_tables=True, **kwargs)
+.. py:class:: SqliteStorage(name='huey', filename='huey.db', cache_mb=8, fsync=None, journal_mode='wal', timeout=5, strict_fifo=False, create_tables=True, claim_ttl=None, clock=None, **kwargs)
 
     :param str name: namespace for storage.
     :param str filename: sqlite database filename.
@@ -2448,8 +2492,23 @@ Huey comes with several built-in storage implementations:
         cause tasks to be run in a different order than the order in which they
         were enqueued.
     :param bool create_tables: create tables if they do not exist.
+    :param float claim_ttl: enables claim (lease) mode. Instead of deleting the
+        row on dequeue, the task is marked as claimed with a lease that expires
+        after ``claim_ttl`` seconds. The consumer confirms the task with
+        :py:meth:`Huey.ack` once processing finishes; if the consumer dies
+        first, another consumer re-claims the task after the lease expires.
+        When ``None`` (the default), dequeue keeps its historical
+        delete-on-read behavior. Tasks are claimed in the same order as a
+        normal dequeue: highest priority first, then insertion order.
+    :param clock: zero-argument callable returning the current unix time used
+        for lease expiry. Defaults to :func:`time.time`; inject a custom clock
+        for testing.
     :param kwargs: Additional keyword arguments passed to the ``sqlite3``
         connection constructor.
+
+    Claim mode adds two nullable columns (``claim_token`` and
+    ``claim_expires``) to the task table; an existing database is migrated in
+    place when the storage is initialized with ``claim_ttl`` set.
 
 
 .. py:class:: CySqliteStorage(name='huey', filename='huey.db', pragmas=None, timeout=5, strict_fifo=False, create_tables=True, **kwargs)

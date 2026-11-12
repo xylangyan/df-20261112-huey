@@ -28,6 +28,7 @@ from huey.exceptions import TaskTimeout
 from huey.registry import Registry
 from huey.serializer import Serializer
 from huey.storage import BlackHoleStorage
+from huey.storage import ClaimedMessage
 from huey.storage import CySqliteStorage
 from huey.storage import FileStorage
 from huey.storage import MemoryStorage
@@ -373,7 +374,45 @@ class Huey(object):
     def dequeue(self):
         data = self.storage.dequeue()
         if data is not None:
-            return self.deserialize_task(data)
+            task = self.deserialize_task(data)
+            if isinstance(data, ClaimedMessage):
+                # The storage is running in claim mode: the task row remains
+                # in the queue until ack() confirms it (or the lease expires).
+                task.ack = data.claim
+            return task
+
+    def ack(self, task):
+        """
+        Confirm that a claimed task has been fully processed, removing its row
+        from the queue. Only applies when the storage runs in claim mode (e.g.
+        ``SqliteHuey(claim_ttl=...)``); returns False if the lease is no longer
+        held by this consumer (e.g. it expired and was re-claimed elsewhere).
+        """
+        claim = getattr(task, 'ack', None)
+        return claim is not None and self.storage.ack(claim)
+
+    def renew_claim(self, task, ttl=None):
+        """
+        Extend the lease on a claimed task, updating ``task.ack`` with the
+        refreshed claim. Returns False when the lease could not be renewed
+        (already expired and possibly re-claimed by another consumer).
+        """
+        claim = getattr(task, 'ack', None)
+        if claim is None:
+            return False
+        claim = self.storage.renew_claim(claim, ttl)
+        if claim is not None:
+            task.ack = claim
+            return True
+        return False
+
+    def release_claim(self, task):
+        """
+        Give up the lease on a claimed task without deleting it, making it
+        immediately available to other consumers.
+        """
+        claim = getattr(task, 'ack', None)
+        return claim is not None and self.storage.release_claim(claim)
 
     def put(self, key, data):
         return self.storage.put_data(key, self.serializer.serialize(data))
@@ -415,19 +454,35 @@ class Huey(object):
             timestamp = self._get_timestamp()
 
         if not self.ready_to_run(task, timestamp):
+            # ETA / delay: the run is deferred to the scheduler, so this
+            # claimed row no longer represents a pending execution.
             self.add_schedule(task)
+            self._ack_task(task)
         elif self.is_revoked(task, timestamp, False):
             logger.warning('Task %s was revoked, not executing', task)
             self._emit(S.SIGNAL_REVOKED, task)
             self._abort_chord_member(task, SKIPPED)
+            self._ack_task(task)
         elif task.expires_resolved and task.expires_resolved < timestamp:
             logger.info('Task %s expired, not executing.', task)
             self._emit(S.SIGNAL_EXPIRED, task)
             self._abort_chord_member(task, SKIPPED)
+            self._ack_task(task)
         else:
             logger.info('Executing %s', task)
             self._emit(S.SIGNAL_EXECUTING, task)
             return self._execute(task, timestamp)
+
+    def _ack_task(self, task):
+        # No-op for storages running without claim mode. A False return means
+        # the lease had already expired and was re-claimed elsewhere, so this
+        # consumer no longer owns the row and must not touch it.
+        if getattr(task, 'ack', None) is not None:
+            if not self.ack(task):
+                logger.warning('Stale ack rejected for task %s: lease lost.',
+                               task.id)
+            else:
+                task.ack = None
 
     def _execute(self, task, timestamp):
         if self._pre_execute:
@@ -436,6 +491,8 @@ class Huey(object):
             except CancelExecution:
                 self._emit(S.SIGNAL_CANCELED, task)
                 self._abort_chord_member(task, SKIPPED)
+                # Cancelled by a pre-execute hook; confirm the lease.
+                self._ack_task(task)
                 return
 
         start = time.monotonic()
@@ -495,6 +552,9 @@ class Huey(object):
         except KeyboardInterrupt:
             logger.warning('Received exit signal, %s did not finish.', task.id)
             self._emit(S.SIGNAL_INTERRUPTED, task)
+            # Keep the claim: on shutdown the lease is left to expire, so the
+            # task is redelivered only after claim_ttl elapses rather than
+            # being handed out again immediately.
             return
         except Exception as exc:
             logger.exception('Unhandled exception in task %s.', task.id)
@@ -519,6 +579,8 @@ class Huey(object):
                 self.enqueue(task.on_complete)
             if task.chord_config is not None:
                 self._check_chord(task.chord_config, task_value)
+            # The task finished successfully; confirm the lease.
+            self._ack_task(task)
         else:
             final = not task.retries
             surface = final or (self.store_intermediate_errors and
@@ -537,9 +599,15 @@ class Huey(object):
                 self.enqueue(handler)
             if final:
                 self._abort_chord_member(task, error)
+                # The task failed for good (or was cancelled without retry);
+                # confirm the lease so the row is removed.
+                self._ack_task(task)
             else:
                 self._emit(S.SIGNAL_RETRYING, task)
                 self._requeue_task(task, self._get_timestamp(), retry_eta)
+                # The retry was re-enqueued (or scheduled) as a fresh row, so
+                # the claimed row no longer represents a pending execution.
+                self._ack_task(task)
 
         return task_value
 
@@ -822,6 +890,9 @@ class Task(object):
         self.timeout = timeout if timeout is not None else self.default_timeout
         self.chord_config = chord_config
         self._deadline = None
+
+        # Lease metadata attached by claim-mode storages; None otherwise.
+        self.ack = None
 
         self.on_complete = on_complete
         self.on_error = on_error

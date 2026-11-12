@@ -612,6 +612,122 @@ class TestSqliteStorage(StorageTests, BaseTestCase):
                          ['task_queue_priority_id'])
 
 
+class TestSqliteClaimStorage(StorageTests, BaseTestCase):
+    supports_ttl = False
+
+    def setUp(self):
+        super(TestSqliteClaimStorage, self).setUp()
+        self.now = [1000.0]
+        self.s.claim_ttl = 30
+        self.s.clock = lambda: self.now[0]
+        # A second consumer sharing the same database file and clock.
+        self.other = SqliteHuey(name=self.huey.name, filename='huey_claim.db',
+                                claim_ttl=30, clock=lambda: self.now[0]).storage
+
+    def get_huey(self):
+        return SqliteHuey(filename='huey_claim.db', timeout=3, claim_ttl=30,
+                          clock=lambda: self.now[0])
+
+    def tearDown(self):
+        self.other.close()
+        super(TestSqliteClaimStorage, self).tearDown()
+        for suffix in ('', '-wal', '-shm'):
+            if os.path.exists('huey_claim.db' + suffix):
+                os.unlink('huey_claim.db' + suffix)
+
+    def test_dequeue_claims_instead_of_deleting(self):
+        self.s.enqueue(b'i1')
+        msg = self.s.dequeue()
+        self.assertEqual(bytes(msg), b'i1')
+        self.assertTrue(isinstance(msg.claim, dict))
+
+        # The row still exists, but is invisible until the lease expires.
+        self.assertTrue(self.s.dequeue() is None)
+        self.assertEqual(self.s.queue_size(), 0)
+        self.assertEqual(self.s.enqueued_items(), [])
+
+        # After the lease expires the task becomes claimable again.
+        self.now[0] += 31
+        self.assertEqual(self.s.queue_size(), 1)
+        msg2 = self.s.dequeue()
+        self.assertEqual(bytes(msg2), b'i1')
+        self.assertNotEqual(msg2.claim['ack'], msg.claim['ack'])
+
+    def test_claim_order_matches_priority_and_fifo(self):
+        self.s.enqueue(b'p0-a')
+        self.s.enqueue(b'p9', priority=9)
+        self.s.enqueue(b'p0-b')
+        self.assertEqual(bytes(self.s.dequeue()), b'p9')
+        self.assertEqual(bytes(self.s.dequeue()), b'p0-a')
+        self.assertEqual(bytes(self.s.dequeue()), b'p0-b')
+
+    def test_two_consumers_cannot_claim_same_task(self):
+        self.s.enqueue(b'i1')
+        msg = self.s.dequeue()
+        self.assertTrue(self.other.dequeue() is None)
+        self.assertTrue(self.s.ack(msg.claim))
+        self.assertEqual(self.s.queue_size(), 0)
+
+    def test_stale_ack_cannot_delete_reclaimed_row(self):
+        self.s.enqueue(b'i1')
+        msg = self.s.dequeue()
+
+        # Lease expires and the other consumer re-claims the task.
+        self.now[0] += 31
+        msg2 = self.other.dequeue()
+        self.assertEqual(bytes(msg2), b'i1')
+
+        # The original consumer returns late: its ack must not delete the row
+        # now owned by the other consumer.
+        self.assertFalse(self.s.ack(msg.claim))
+        self.assertTrue(self.s.dequeue() is None)  # Still claimed by other.
+        self.assertTrue(self.other.ack(msg2.claim))
+        self.assertEqual(self.s.queue_size(), 0)
+
+    def test_renew_claim(self):
+        self.s.enqueue(b'i1')
+        msg = self.s.dequeue()
+
+        # Renewing extends the lease; the other consumer cannot steal it.
+        self.now[0] += 20
+        claim = self.s.renew_claim(msg.claim, ttl=30)
+        self.assertEqual(claim['expires'], 1050.0)
+        self.now[0] += 11  # Past the original expiry.
+        self.assertTrue(self.other.dequeue() is None)
+
+        # Renewing with an expired lease fails, and the task can be claimed.
+        self.now[0] += 20
+        self.assertTrue(self.s.renew_claim(claim) is None)
+        msg2 = self.other.dequeue()
+        self.assertEqual(bytes(msg2), b'i1')
+        self.assertTrue(self.other.ack(msg2.claim))
+
+    def test_release_claim(self):
+        self.s.enqueue(b'i1')
+        msg = self.s.dequeue()
+        self.assertTrue(self.s.release_claim(msg.claim))
+        # Releasing makes the task immediately available again.
+        msg2 = self.other.dequeue()
+        self.assertEqual(bytes(msg2), b'i1')
+        # The released lease is invalid for acking.
+        self.assertFalse(self.s.ack(msg.claim))
+        self.assertTrue(self.other.ack(msg2.claim))
+
+    def test_ack_idempotent(self):
+        self.s.enqueue(b'i1')
+        msg = self.s.dequeue()
+        self.assertTrue(self.s.ack(msg.claim))
+        self.assertFalse(self.s.ack(msg.claim))
+        self.assertEqual(self.s.queue_size(), 0)
+
+    def test_schema_migration_idempotent(self):
+        # Re-initializing an existing claim-mode database must not fail on
+        # the duplicate claim columns.
+        self.s.initialize_schema()
+        self.s.enqueue(b'i1')
+        self.assertEqual(bytes(self.s.dequeue()), b'i1')
+
+
 @unittest.skipIf(cysqlite is None, 'requires cysqlite')
 class TestCySqliteStorage(StorageTests, BaseTestCase):
     supports_ttl = False
