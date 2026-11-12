@@ -17,6 +17,7 @@ from huey.api import group
 from huey.constants import EmptyData
 from huey.exceptions import CancelExecution
 from huey.exceptions import RateLimitExceeded
+from huey.exceptions import ResourceLimitExceeded
 from huey.exceptions import ResultTimeout
 from huey.exceptions import ConfigurationError
 from huey.exceptions import RetryTask
@@ -2866,6 +2867,156 @@ class TestRateLimit(BaseTestCase):
         self.assertEqual(task.retries, 1)  # Task retries decremented.
         self.assertEqual(task.retry_delay, 10)  # Task retains retry delay.
         self.huey.storage.flush_schedule()
+
+
+class TestResourceLimit(BaseTestCase):
+    def test_acquire_release(self):
+        s = self.huey.storage
+        t1 = s.acquire_slot('res', 2)
+        t2 = s.acquire_slot('res', 2)
+        self.assertTrue(t1 and t2)
+        self.assertNotEqual(t1, t2)
+        self.assertEqual(s.slot_count('res'), 2)
+
+        # At capacity.
+        self.assertTrue(s.acquire_slot('res', 2) is None)
+        self.assertEqual(s.slot_count('res'), 2)
+
+        # Releasing frees exactly one slot.
+        self.assertTrue(s.release_slot('res', t1))
+        self.assertEqual(s.slot_count('res'), 1)
+        t3 = s.acquire_slot('res', 2)
+        self.assertTrue(t3 is not None)
+        self.assertTrue(s.acquire_slot('res', 2) is None)
+
+        # Double-release and unknown tokens are no-ops.
+        self.assertFalse(s.release_slot('res', t1))
+        self.assertFalse(s.release_slot('res', 'nope'))
+        self.assertEqual(s.slot_count('res'), 2)
+
+        # Resources are independent.
+        self.assertTrue(s.acquire_slot('other', 1) is not None)
+        self.assertTrue(s.acquire_slot('other', 1) is None)
+
+    def test_ttl_reclaim_and_fencing(self):
+        s = self.huey.storage
+        old = s.acquire_slot('res', 1, ttl=0.05)
+        self.assertTrue(old is not None)
+        self.assertTrue(s.acquire_slot('res', 1, ttl=0.05) is None)
+
+        # Once the holder's lease expires, the slot is reclaimed.
+        time.sleep(0.06)
+        new = s.acquire_slot('res', 1, ttl=60)
+        self.assertTrue(new is not None)
+        self.assertNotEqual(old, new)
+
+        # A late release from the vanished holder cannot free the slot that
+        # was lent out again.
+        self.assertFalse(s.release_slot('res', old))
+        self.assertEqual(s.slot_count('res'), 1)
+        self.assertTrue(s.acquire_slot('res', 1) is None)
+
+        # The current holder can still release normally.
+        self.assertTrue(s.release_slot('res', new))
+        self.assertEqual(s.slot_count('res'), 0)
+
+    def test_ctx_decorator(self):
+        rl = self.huey.resource_limit('res', limit=1)
+
+        @rl
+        def deco():
+            return rl.current_usage()
+
+        def ctx():
+            # A separate instance per with-block, sharing the same resource.
+            with self.huey.resource_limit('res', limit=1):
+                return rl.current_usage()
+
+        self.assertEqual(deco(), 1)  # Slot held while running.
+        self.assertEqual(ctx(), 1)
+        self.assertEqual(rl.current_usage(), 0)  # Released afterwards.
+
+        # Hold the only slot; both forms raise ResourceLimitExceeded.
+        token = rl.acquire()
+        self.assertRaises(ResourceLimitExceeded, deco)
+        self.assertRaises(ResourceLimitExceeded, ctx)
+        self.assertTrue(rl.release())
+        self.assertEqual(deco(), 1)
+
+    def test_reentrant_instance_rejected(self):
+        rl = self.huey.resource_limit('res', limit=2)
+        self.assertTrue(rl.acquire() is not None)
+        # Re-entering an already-held instance is a programming error.
+        self.assertRaises(RuntimeError, rl.acquire)
+        self.assertTrue(rl.release())
+        # Sequential reuse after release still works.
+        self.assertTrue(rl.acquire() is not None)
+        self.assertTrue(rl.release())
+        self.assertEqual(rl.current_usage(), 0)
+
+    def test_exception_releases_slot(self):
+        rl = self.huey.resource_limit('res', limit=1)
+
+        @rl
+        def fails():
+            raise TestError('uh-oh')
+
+        self.assertRaises(TestError, fails)
+        self.assertEqual(rl.current_usage(), 0)  # Slot freed on exception.
+
+        # And the resource can be used again immediately.
+        self.assertTrue(rl.acquire() is not None)
+
+    def test_invalid_limit(self):
+        self.assertRaises(ValueError, self.huey.resource_limit, 'res', 0)
+
+    def test_exceeded_pickles(self):
+        exc = pickle.loads(pickle.dumps(ResourceLimitExceeded('res', 1.5)))
+        self.assertEqual((exc.key, exc.delay), ('res', 1.5))
+
+    def test_delayed_task_keeps_retries(self):
+        state = []
+
+        @self.huey.task(retries=2, retry_delay=600)
+        @self.huey.resource_limit('res', limit=1, retry_delay=0.01)
+        def limited(n):
+            state.append(n)
+            return n
+
+        r1 = limited(1)
+        held = self.huey.storage.acquire_slot('res', 1)
+
+        # Task cannot acquire a slot: it is rescheduled, not executed, and
+        # nothing is stored as a result or error.
+        self.assertTrue(self.execute_next() is None)
+        self.assertEqual(state, [])
+        self.assertTrue(r1.get() is None)
+        self.assertEqual(self.huey.scheduled_count(), 1)
+
+        # The task's own retries and retry-delay are untouched.
+        task, = self.huey.scheduled()
+        self.assertEqual(task.retries, 2)
+        self.assertEqual(task.retry_delay, 600)
+
+        # Once the slot is free and the delay elapses, the task runs.
+        self.huey.storage.release_slot('res', held)
+        ts = datetime.datetime.now() + datetime.timedelta(seconds=1)
+        self.assertEqual(self.huey.execute(task, timestamp=ts), 1)
+        self.assertEqual(state, [1])
+        self.assertEqual(r1.get(), 1)
+        self.assertEqual(self.huey.storage.slot_count('res'), 0)
+
+    def test_task_error_releases_slot(self):
+        @self.huey.task()
+        @self.huey.resource_limit('res', limit=1)
+        def fails():
+            raise TestError('uh-oh')
+
+        r1 = fails()
+        self.assertTrue(self.execute_next() is None)
+        err = self.trap_exception(r1)
+        self.assertTrue('TestError' in err.metadata['error'])
+        self.assertEqual(self.huey.storage.slot_count('res'), 0)
 
 
 class TestHueyAPIs(BaseTestCase):

@@ -23,6 +23,7 @@ from huey.exceptions import TaskTimeout
 from huey.signals import SIGNAL_COMPLETE
 from huey.signals import SIGNAL_ERROR
 from huey.signals import SIGNAL_INTERRUPTED
+from huey.signals import SIGNAL_RATE_LIMITED
 from huey.tests.base import BaseTestCase
 from huey.tests.base import slow_test
 
@@ -475,6 +476,144 @@ class TestProcessTimeout(unittest.TestCase):
         with ProcessEnvironment().timeout(0.15):
             pass
         time.sleep(0.2)  # No stray alarm fires after the context exits.
+
+
+class ResourceLimitAcceptanceTests(object):
+    """
+    Two mirror-site crawlers (directory and detail tasks) share one upstream
+    connection pool, modeled as a resource limit of 2. An unlimited control
+    task must always get through. The release of a vanished holder's slot
+    arrives only after its slot has been lent out again, and must not free
+    the new holder's slot.
+    """
+    def test_shared_resource_limit(self):
+        events = []
+        events_lock = threading.Lock()
+        limited_active = [0]
+        limited_peak = [0]
+
+        def record(name):
+            with events_lock:
+                events.append(name)
+            return name
+
+        def enter_limited():
+            with events_lock:
+                limited_active[0] += 1
+                limited_peak[0] = max(limited_peak[0], limited_active[0])
+
+        def leave_limited():
+            with events_lock:
+                limited_active[0] -= 1
+
+        release_a = threading.Event()
+        release_b = threading.Event()
+        started_a = threading.Event()
+        started_b = threading.Event()
+        delayed_b = threading.Event()
+        pool = self.huey.resource_limit('upstream', limit=2, ttl=None,
+                                        retry_delay=0.05)
+
+        @self.huey.signal(SIGNAL_RATE_LIMITED)
+        def on_rate_limited(signal, task, *args, **kwargs):
+            if task.name == 'crawl_detail':
+                delayed_b.set()
+
+        @self.huey.task()
+        @pool
+        def crawl_directory():
+            enter_limited()
+            try:
+                started_a.set()
+                release_a.wait(10)
+                return record('dir_a')
+            finally:
+                leave_limited()
+
+        @self.huey.task()
+        @pool
+        def crawl_detail():
+            enter_limited()
+            try:
+                started_b.set()
+                release_b.wait(10)
+                return record('detail_b')
+            finally:
+                leave_limited()
+
+        @self.huey.task()
+        def control():
+            return record('control')
+
+        # Take the first slot as a vanished holder before any task runs, so
+        # the directory task can only ever take the second one.
+        stale_deadline = time.monotonic() + 0.2
+        stale = self.huey.storage.acquire_slot('upstream', 2, ttl=0.2)
+        self.assertTrue(stale is not None)
+
+        with self.consumer_context():
+            r_dir = crawl_directory()
+            r_detail = crawl_detail()
+            r_control = control()
+            self.assertTrue(started_a.wait(10))  # dir_a holds slot 2 of 2.
+
+            # The pool is full, so detail_b is rescheduled rather than run.
+            self.assertTrue(delayed_b.wait(10))
+
+            # The unlimited control task is not stuck behind the delayed task.
+            self.assertEqual(r_control.get(blocking=True, timeout=10),
+                             'control')
+            self.assertEqual(events, ['control'])
+            self.assertEqual(self.huey.storage.slot_count('upstream'), 2)
+
+            # The vanished holder's lease expires, its slot is reclaimed, and
+            # detail_b borrows it while dir_a still holds the other slot.
+            self.assertTrue(started_b.wait(10))
+            self.assertGreaterEqual(time.monotonic(), stale_deadline)
+            self.assertFalse(release_a.is_set())
+            self.assertEqual(events, ['control'])
+            self.assertEqual(self.huey.storage.slot_count('upstream'), 2)
+            self.assertEqual(limited_peak[0], 2)
+
+            # Only now does the vanished holder's release arrive. It must not
+            # free the slot that has since been lent out to detail_b.
+            self.assertFalse(self.huey.storage.release_slot('upstream',
+                                                            stale))
+            self.assertEqual(self.huey.storage.slot_count('upstream'), 2)
+
+            # detail_b finishes next; dir_a is last.
+            release_b.set()
+            self.assertEqual(r_detail.get(blocking=True, timeout=10),
+                             'detail_b')
+            self.assertEqual(events, ['control', 'detail_b'])
+            release_a.set()
+            self.assertEqual(r_dir.get(blocking=True, timeout=10), 'dir_a')
+            self.assertEqual(events, ['control', 'detail_b', 'dir_a'])
+            self.assertEqual(limited_peak[0], 2)  # Never above the limit.
+
+        self.assertEqual(self.huey.storage.slot_count('upstream'), 0)
+
+
+class TestResourceLimitAcceptanceMemory(ResourceLimitAcceptanceTests,
+                                        BaseTestCase):
+    consumer_class = TestConsumer
+
+
+class TestResourceLimitAcceptanceSqlite(ResourceLimitAcceptanceTests,
+                                        BaseTestCase):
+    consumer_class = TestConsumer
+
+    def setUp(self):
+        self._tmp_dir = tempfile.mkdtemp()
+        super(TestResourceLimitAcceptanceSqlite, self).setUp()
+
+    def tearDown(self):
+        super(TestResourceLimitAcceptanceSqlite, self).tearDown()
+        shutil.rmtree(self._tmp_dir, ignore_errors=True)
+
+    def get_huey(self):
+        filename = os.path.join(self._tmp_dir, 'huey.db')
+        return SqliteHuey(filename=filename, utc=False)
 
 
 class TestProcessWorkers(unittest.TestCase):

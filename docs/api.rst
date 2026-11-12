@@ -1071,6 +1071,71 @@ Huey object
         In the above code, if the task fails due to being rate-limited, it will
         be retried up to 2 times after a delay of 120s between retries.
 
+    .. py:method:: resource_limit(name, limit, ttl=None, retry_delay=None)
+
+        :param str name: Resource name. All task functions (or blocks) using
+            the same name share one capacity limit.
+        :param int limit: Maximum number of tasks concurrently holding a slot.
+        :param float ttl: Optional lease length in seconds. A slot whose holder
+            disappears is reclaimed once its lease expires.
+        :param float retry_delay: Seconds to wait before retrying a task that
+            could not get a slot. Defaults to 1 second.
+        :returns: :py:class:`ResourceLimit` instance, which can be used as a
+            decorator or context-manager.
+
+        Limit the number of tasks concurrently holding a slot on a *named
+        resource*, so that different task functions can attach to one shared
+        capacity. This is useful when, for example, two mirror-site crawlers
+        share one upstream connection pool: their directory and detail tasks
+        may be separate functions, but together they must not exceed the pool's
+        two connections.
+
+        A slot is held for the duration of the task and released when the task
+        finishes, whether it returned, raised an error, or timed out. When no
+        slot is available the task raises :py:class:`ResourceLimitExceeded`
+        and is rescheduled to try again after ``retry_delay`` seconds. This
+        does **not** consume any of the task's own ``retries``, and the
+        consumer keeps processing other tasks while the delayed task waits.
+
+        Example: directory and detail tasks, each with several sites, all
+        sharing a pool of two connections:
+
+        .. code-block:: python
+
+            pool = huey.resource_limit('upstream-pool', limit=2, ttl=300)
+
+            @huey.task()
+            @pool
+            def crawl_directory(site, page):
+                return fetch_directory(site, page)
+
+            @huey.task()
+            @pool
+            def crawl_detail(site, item_id):
+                return fetch_detail(site, item_id)
+
+        Tasks that cannot get a slot emit a ``SIGNAL_RATE_LIMITED``.
+
+        Pass ``ttl`` so that a slot held by a worker that died or was killed is
+        reclaimed after the lease expires instead of blocking the resource
+        forever. Slots are fenced by an opaque token, so a late release from a
+        vanished holder cannot free a slot that has since been lent out to
+        another task.
+
+        Resource limits are supported by the memory and sqlite storages.
+        Other storages raise ``NotImplementedError``.
+
+        When using it as a context-manager, create a separate instance per
+        ``with`` block instead of sharing one instance between concurrent
+        holders:
+
+        .. code-block:: python
+
+            @huey.task()
+            def crawl(url):
+                with huey.resource_limit('upstream-pool', limit=2):
+                    return fetch(url)
+
     .. py:method:: put(key, data)
 
         :param key: key for data
@@ -1667,6 +1732,50 @@ Huey object
         :py:meth:`~RateLimit.current_usage`. This is called automatically when
         the rate-limiter is used as a decorator or context-manager.
 
+
+.. py:class:: ResourceLimit(huey, name, limit, ttl=None, retry_delay=None)
+
+    This class should not be instantiated directly, but is instead returned by
+    :py:meth:`Huey.resource_limit`. This object implements a context-manager
+    or decorator which limits the number of concurrent holders of a slot on
+    the named resource. Different task functions using the same resource name
+    share one capacity limit.
+
+    When a task cannot get a slot, it raises
+    :py:class:`ResourceLimitExceeded` and Huey reschedules it to try again
+    after ``retry_delay`` seconds, without consuming any of the task's own
+    retries. The slot is released automatically when the task finishes,
+    including when it raises an exception. Slots held by a holder that
+    disappears are reclaimed once their ``ttl`` lease expires; a late release
+    from such a holder cannot free a slot that has been lent out again.
+
+    Tasks that cannot get a slot emit a ``SIGNAL_RATE_LIMITED``.
+
+    :param str name: Resource name shared by all attached task functions.
+    :param int limit: Maximum number of concurrent slot holders.
+    :param float ttl: Optional lease length in seconds.
+    :param float retry_delay: Seconds to wait before retrying a task that
+        could not get a slot. Defaults to 1 second.
+    :returns: :py:class:`ResourceLimit` instance, which can be used as a
+        decorator or context-manager.
+
+    .. py:method:: acquire()
+
+        Acquire a slot, raising :py:class:`ResourceLimitExceeded` if all
+        ``limit`` slots are in use. Returns an opaque token identifying the
+        lease. This is called automatically when the resource limit is used
+        as a decorator or context-manager.
+
+    .. py:method:: release()
+
+        Release the slot held by this instance. Releasing an
+        already-released or reclaimed lease is a no-op. This is called
+        automatically when the resource limit is used as a decorator or
+        context-manager.
+
+    .. py:method:: current_usage()
+
+        :returns: the number of slots currently held on the resource.
 
 
 .. py:class:: group(tasks)

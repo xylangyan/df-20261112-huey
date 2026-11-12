@@ -58,6 +58,7 @@ requires_redis = unittest.skipIf(REDIS_VERSION == 0, 'requires redis server')
 class StorageTests(object):
     destructive_reads = True
     supports_ttl = True
+    supports_slots = False
 
     def setUp(self):
         super(StorageTests, self).setUp()
@@ -234,6 +235,53 @@ class StorageTests(object):
         self.assertEqual(self.s.pop_data('k1'), b'test')
         self.assertEqual(self.s.incr('k1'), 4)
 
+    def test_slots_capacity_and_fencing(self):
+        if not self.supports_slots:
+            self.assertRaises(NotImplementedError, self.s.acquire_slot,
+                              'res', 1)
+            self.assertRaises(NotImplementedError, self.s.release_slot,
+                              'res', 'token')
+            self.assertRaises(NotImplementedError, self.s.slot_count, 'res')
+            return
+
+        t1 = self.s.acquire_slot('res', 2)
+        t2 = self.s.acquire_slot('res', 2)
+        self.assertTrue(t1 and t2 and t1 != t2)
+        self.assertEqual(self.s.slot_count('res'), 2)
+        self.assertTrue(self.s.acquire_slot('res', 2) is None)
+
+        # Releasing one slot frees exactly one lease; double/unknown release
+        # cannot free anything.
+        self.assertTrue(self.s.release_slot('res', t1))
+        self.assertFalse(self.s.release_slot('res', t1))
+        self.assertFalse(self.s.release_slot('res', 'unknown'))
+        t3 = self.s.acquire_slot('res', 2)
+        self.assertTrue(t3 is not None)
+        self.assertTrue(self.s.acquire_slot('res', 2) is None)
+
+        # Resources are independent.
+        other_t = self.s.acquire_slot('other', 1)
+        self.assertTrue(other_t is not None)
+        self.assertTrue(self.s.acquire_slot('other', 1) is None)
+        self.assertTrue(self.s.release_slot('other', other_t))
+
+        # Expired leases are reclaimed, and the old token is fenced off.
+        self.assertTrue(self.s.release_slot('res', t2))
+        old = self.s.acquire_slot('res', 2, ttl=0.1)
+        self.assertTrue(old is not None)
+        self.assertTrue(self.s.acquire_slot('res', 2) is None)
+        time.sleep(0.15)
+        new = self.s.acquire_slot('res', 2, ttl=1)
+        self.assertTrue(new is not None)
+        self.assertNotEqual(old, new)
+        self.assertFalse(self.s.release_slot('res', old))
+        self.assertEqual(self.s.slot_count('res'), 2)
+
+        # All current holders can still release normally.
+        self.assertTrue(self.s.release_slot('res', new))
+        self.assertTrue(self.s.release_slot('res', t3))
+        self.assertEqual(self.s.slot_count('res'), 0)
+
     @slow_test()
     def test_consumer_integration(self):
         @self.huey.task()
@@ -264,6 +312,8 @@ class StorageTests(object):
 
 
 class TestMemoryStorage(StorageTests, BaseTestCase):
+    supports_slots = True
+
     def get_huey(self):
         return MemoryHuey(utc=False)
 
@@ -502,6 +552,7 @@ class TestRedisStorageOffline(BaseTestCase):
 
 class TestSqliteStorage(StorageTests, BaseTestCase):
     supports_ttl = False
+    supports_slots = True
 
     def tearDown(self):
         super(TestSqliteStorage, self).tearDown()
@@ -615,6 +666,7 @@ class TestSqliteStorage(StorageTests, BaseTestCase):
 @unittest.skipIf(cysqlite is None, 'requires cysqlite')
 class TestCySqliteStorage(StorageTests, BaseTestCase):
     supports_ttl = False
+    supports_slots = True
 
     def tearDown(self):
         super(TestCySqliteStorage, self).tearDown()

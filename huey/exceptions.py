@@ -15,6 +15,15 @@ class RateLimitExceeded(HueyException):
                 self.key, self.delay)
         return 'Rate limit exceeded on "%s"' % self.key
 
+class ResourceLimitExceeded(HueyException):
+    def __init__(self, key, delay):
+        self.key, self.delay = key, delay
+        super(ResourceLimitExceeded, self).__init__(key, delay)
+
+    def __str__(self):
+        return 'Resource "%s" has no slots available, retry in %0.1fs' % (
+            self.key, self.delay)
+
 class CancelExecution(Exception):
     def __init__(self, msg=None, retry=None):
         self.retry = retry
@@ -34,4 +43,5 @@ class TaskException(Exception):
 
 
 # Not failures while a retry is pending.
-RETRYING_EXCEPTIONS = (RetryTask, RateLimitExceeded, TaskLockedException)
+RETRYING_EXCEPTIONS = (RetryTask, RateLimitExceeded, ResourceLimitExceeded,
+                       TaskLockedException)

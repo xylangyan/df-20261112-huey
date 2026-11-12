@@ -13,6 +13,7 @@ except ImportError:
 import struct
 import threading
 import time
+import uuid
 
 try:
     import cysqlite
@@ -265,6 +266,51 @@ class BaseStorage(object):
         """
         raise NotImplementedError
 
+    def acquire_slot(self, resource, capacity, ttl=None):
+        """
+        Attempt to acquire one of ``capacity`` slots for the named resource.
+        Slots are shared by every caller referencing the same resource name,
+        regardless of which task function they belong to.
+
+        Stale slots whose holders have expired (when ``ttl`` is given) are
+        reclaimed first, so a vanished holder cannot permanently consume a
+        slot. The returned opaque token fences the lease: the same token must
+        be handed back to :meth:`release_slot`, and a late release of a
+        reclaimed token cannot free a slot that has since been lent out again.
+
+        :param str resource: Resource name.
+        :param int capacity: Maximum number of concurrent slot holders.
+        :param float ttl: Optional lease length in seconds. Slots not released
+            within this time become reclaimable.
+        :return: A token identifying the lease, or None if all slots are in
+            use.
+        """
+        raise NotImplementedError
+
+    def release_slot(self, resource, token):
+        """
+        Release a slot previously acquired with :meth:`acquire_slot`. Only the
+        current holder of the given token is affected; releasing an unknown,
+        already-released or reclaimed token is a no-op.
+
+        :return: Boolean indicating whether a slot was released.
+        """
+        raise NotImplementedError
+
+    def slot_count(self, resource):
+        """
+        Return the number of slots currently held (after reclamation) for the
+        named resource.
+        """
+        raise NotImplementedError
+
+    def flush_slots(self):
+        """
+        Release every held slot. Storages without slot support have nothing to
+        clear, so this defaults to a no-op.
+        """
+        pass
+
     def result_store_size(self):
         """
         :return: Number of key/value pairs in the result store.
@@ -306,6 +352,7 @@ class BaseStorage(object):
         self.flush_schedule()
         self.flush_results()
         self.flush_counters()
+        self.flush_slots()
 
 
 class BlackHoleStorage(BaseStorage):
@@ -326,6 +373,9 @@ class BlackHoleStorage(BaseStorage):
     def put_if_empty(self, key, value, ttl=None): return True
     def incr(self, key, amount=1): return amount
     def delete_counter(self, key): pass
+    def acquire_slot(self, resource, capacity, ttl=None): return '1'
+    def release_slot(self, resource, token): return True
+    def slot_count(self, resource): return 0
     def result_store_size(self): return 0
     def result_items(self): return {}
     def flush_results(self): pass
@@ -340,6 +390,7 @@ class MemoryStorage(BaseStorage):
         self._results = {}
         self._schedule = []
         self._counters = {}
+        self._slots = {}  # Resource name -> {token: expiration or None}.
         self._lock = threading.RLock()
 
     def enqueue(self, data, priority=None):
@@ -425,6 +476,43 @@ class MemoryStorage(BaseStorage):
     def delete_counter(self, key):
         with self._lock:
             self._counters.pop(key, None)
+
+    def _reclaim_slots(self, resource, now):
+        # Caller holds the lock. Drop slots whose lease has expired.
+        slots = self._slots.get(resource)
+        if slots:
+            expired = [t for t, exp in slots.items()
+                       if exp is not None and exp <= now]
+            for token in expired:
+                del slots[token]
+
+    def acquire_slot(self, resource, capacity, ttl=None):
+        with self._lock:
+            now = time.monotonic()
+            self._reclaim_slots(resource, now)
+            slots = self._slots.setdefault(resource, {})
+            if len(slots) >= capacity:
+                return None
+            token = uuid.uuid4().hex
+            slots[token] = now + ttl if ttl is not None else None
+            return token
+
+    def release_slot(self, resource, token):
+        with self._lock:
+            slots = self._slots.get(resource)
+            if slots and token in slots:
+                del slots[token]
+                return True
+            return False
+
+    def slot_count(self, resource):
+        with self._lock:
+            self._reclaim_slots(resource, time.monotonic())
+            return len(self._slots.get(resource, ()))
+
+    def flush_slots(self):
+        with self._lock:
+            self._slots = {}
 
     def result_store_size(self):
         return len(self._results)
@@ -870,8 +958,12 @@ class SqliteStorage(BaseSqlStorage):
                      'queue text not null, key text not null, '
                      'value integer not null default 0, '
                      'primary key(queue, key))')
+    table_slot = ('create table if not exists slot ('
+                  'queue text not null, resource text not null, '
+                  'token text not null, expires real, '
+                  'primary key(queue, resource, token))')
     ddl = [table_kv, table_sched, index_sched, table_task, index_task,
-           table_counter, drop_index_task]
+           table_counter, drop_index_task, table_slot]
 
     def __init__(self, name='huey', filename='huey.db', cache_mb=8,
                  fsync=None, journal_mode='wal', timeout=5, strict_fifo=False,
@@ -1060,6 +1152,43 @@ class SqliteStorage(BaseSqlStorage):
     def delete_counter(self, key):
         self.sql('delete from counter where queue = ? and key = ?',
                  (self.name, key), commit=True)
+
+    def _reclaim_slots(self, curs, resource, now):
+        # Caller holds the write lock. Drop slots whose lease has expired.
+        curs.execute('delete from slot where queue = ? and resource = ? and '
+                     'expires is not null and expires <= ?',
+                     (self.name, resource, now))
+
+    def acquire_slot(self, resource, capacity, ttl=None):
+        now = time.time()
+        expires = now + ttl if ttl is not None else None
+        with self.db(commit=True) as curs:
+            self._reclaim_slots(curs, resource, now)
+            curs.execute('select count(*) from slot where queue = ? and '
+                         'resource = ?', (self.name, resource))
+            if curs.fetchone()[0] >= capacity:
+                return None
+            token = uuid.uuid4().hex
+            curs.execute('insert into slot (queue, resource, token, expires) '
+                         'values (?, ?, ?, ?)',
+                         (self.name, resource, token, expires))
+            return token
+
+    def release_slot(self, resource, token):
+        with self.db(commit=True) as curs:
+            curs.execute('delete from slot where queue = ? and resource = ? '
+                         'and token = ?', (self.name, resource, token))
+            return curs.rowcount == 1
+
+    def slot_count(self, resource):
+        with self.db(commit=True) as curs:
+            self._reclaim_slots(curs, resource, time.time())
+            curs.execute('select count(*) from slot where queue = ? and '
+                         'resource = ?', (self.name, resource))
+            return curs.fetchone()[0]
+
+    def flush_slots(self):
+        self.sql('delete from slot where queue = ?', (self.name,), commit=True)
 
     def result_store_size(self):
         return self.sql('select count(*) from kv where queue=?', (self.name,),

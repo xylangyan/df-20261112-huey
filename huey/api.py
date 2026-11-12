@@ -19,6 +19,7 @@ from huey.consumer import Consumer
 from huey.exceptions import CancelExecution
 from huey.exceptions import ConfigurationError
 from huey.exceptions import RateLimitExceeded
+from huey.exceptions import ResourceLimitExceeded
 from huey.exceptions import RETRYING_EXCEPTIONS
 from huey.exceptions import ResultTimeout
 from huey.exceptions import RetryTask
@@ -472,6 +473,16 @@ class Huey(object):
                 logger.info('Task %s rate-limited on "%s"', task.id, exc.key)
             exception = exc
             self._emit(S.SIGNAL_RATE_LIMITED, task)
+        except ResourceLimitExceeded as exc:
+            # No slot was available, so the task is rescheduled to try again
+            # shortly. The extra retry is consumed and restored by
+            # _requeue_task, so the task's own retries are left untouched.
+            task.retries += 1
+            logger.info('Task %s delayed, resource "%s" has no free slots, '
+                        'retrying in %s.', task.id, exc.key, exc.delay)
+            retry_eta = normalize_time(None, exc.delay, self.utc)
+            exception = exc
+            self._emit(S.SIGNAL_RATE_LIMITED, task)
         except TaskLockedException as exc:
             logger.warning('Task %s not run, %s.', task.id, exc)
             exception = exc
@@ -776,6 +787,10 @@ class Huey(object):
 
     def rate_limit(self, name, limit, per, retry=True):
         return RateLimit(self, name, limit, per, retry=retry)
+
+    def resource_limit(self, name, limit, ttl=None, retry_delay=None):
+        return ResourceLimit(self, name, limit, ttl=ttl,
+                             retry_delay=retry_delay)
 
     def _result_handle(self, task):
         return Result(self, task)
@@ -1153,6 +1168,84 @@ class RateLimit(object):
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         pass
+
+
+class ResourceLimit(object):
+    """
+    Limit the number of tasks concurrently holding a slot on a named
+    resource. Different task functions can attach to the same resource name
+    to share one capacity limit, e.g. two mirror-site crawlers whose
+    directory and detail tasks draw from a single upstream connection pool.
+
+    Unlike :py:class:`RateLimit`, which counts invocations within a time
+    window, a resource slot is held for the duration of the task and released
+    when it finishes (whether it succeeded, failed or raised). When no slot
+    is available the task raises :py:class:`ResourceLimitExceeded` and Huey
+    reschedules it to try again after ``retry_delay`` seconds, without
+    consuming any of the task's own retries.
+
+    Pass ``ttl`` (seconds) so a slot held by a worker that disappears can be
+    reclaimed once its lease expires. Reclamation is fenced by a token: a
+    late release from the vanished holder cannot free a slot that has since
+    been lent out to another task.
+
+    Can be used as a decorator or context-manager. The decorator handles
+    concurrent invocations correctly by giving each call its own lease. When
+    using it as a context-manager, create a separate instance per ``with``
+    block rather than sharing one across concurrent holders. For more
+    details see :py:meth:`Huey.resource_limit`.
+    """
+    def __init__(self, huey, name, limit, ttl=None, retry_delay=None):
+        if limit < 1:
+            raise ValueError('resource limit must be >= 1')
+        self._huey = huey
+        self._name = name
+        self._limit = limit
+        self._ttl = ttl
+        self._retry_delay = 1.0 if retry_delay is None else retry_delay
+        self._token = None
+
+    def acquire(self):
+        if self._token is not None:
+            raise RuntimeError('resource limit already acquired; use a '
+                               'separate instance per holder')
+        token = self._huey.storage.acquire_slot(
+            self._name, self._limit, ttl=self._ttl)
+        if token is None:
+            raise ResourceLimitExceeded(self._name, self._retry_delay)
+        self._token = token
+        return token
+
+    def release(self):
+        # Only the current holder of the token is affected. Releasing a
+        # token that was already released or reclaimed is a no-op.
+        token, self._token = self._token, None
+        if token is not None:
+            return self._huey.storage.release_slot(self._name, token)
+        return False
+
+    def current_usage(self):
+        return self._huey.storage.slot_count(self._name)
+
+    def _clone(self):
+        # Each invocation needs its own lease state, since one ResourceLimit
+        # may decorate multiple functions that share a capacity.
+        return ResourceLimit(self._huey, self._name, self._limit,
+                             ttl=self._ttl, retry_delay=self._retry_delay)
+
+    def __call__(self, fn):
+        @wraps(fn)
+        def inner(*args, **kwargs):
+            with self._clone():
+                return fn(*args, **kwargs)
+        return inner
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
 
 
 class group(object):

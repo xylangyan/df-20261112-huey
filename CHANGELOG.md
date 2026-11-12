@@ -3,6 +3,12 @@ Changelog
 
 ## Master
 
+* Add `Huey.resource_limit()` for sharing one concurrency capacity across
+  multiple task functions, configured by resource name. Supports memory and
+  sqlite storage, lease-based reclamation of slots held by vanished workers,
+  and fencing of late releases. Delayed tasks are rescheduled without
+  consuming their own retries.
+
 [View commits](https://github.com/coleifer/huey/compare/3.5.4...master)
 
 ## 3.5.4

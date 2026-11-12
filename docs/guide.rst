@@ -962,6 +962,57 @@ Equivalent example using a context-manager instead of a decorator:
 
 See :py:meth:`Huey.rate_limit` for API documentation.
 
+.. _shared-resource-limits:
+
+Shared Resource Capacity
+------------------------
+
+``lock_task`` allows exactly one invocation at a time, and ``rate_limit``
+counts invocations in a time window. Neither expresses "at most *N* tasks in
+flight at once, across several different task functions". That is what
+:py:meth:`Huey.resource_limit` does: it names a resource and a capacity, and
+every task function attached to that name draws from the same pool of slots.
+
+Consider two mirror-sites whose directory and detail tasks share one upstream
+connection pool that only allows two connections:
+
+.. code-block:: python
+
+    pool = huey.resource_limit('upstream-pool', limit=2, ttl=300)
+
+    @huey.task()
+    @pool
+    def crawl_directory(site, page):
+        return fetch_directory(site, page)
+
+    @huey.task()
+    @pool
+    def crawl_detail(site, item_id):
+        return fetch_detail(site, item_id)
+
+Two slots are shared by all four combinations of site and task type. A task
+holds its slot for its whole duration and releases it when it returns or
+raises. If no slot is free, the task raises ``ResourceLimitExceeded`` and Huey
+reschedules it to try again shortly (``retry_delay``, one second by default).
+This does not consume the task's own ``retries``, and the consumer keeps
+working on other tasks instead of blocking.
+
+Pass ``ttl`` (seconds) so that a slot held by a worker that died or was killed
+is reclaimed after the lease expires. Slots are fenced by a token internally,
+so a late release from a vanished holder cannot free a slot that has since
+been lent out to another task. Like ``lock_task``, the memory and sqlite
+storages support this; other storages raise ``NotImplementedError``.
+
+Limits are per resource name, so unrelated resources can be configured
+independently:
+
+.. code-block:: python
+
+    huey.resource_limit('upstream-pool', limit=2)      # Two connections.
+    huey.resource_limit('image-service', limit=5)      # Five at a time.
+
+See :py:meth:`Huey.resource_limit` for API documentation.
+
 Task pipelines
 --------------
 
