@@ -37,6 +37,7 @@ from huey.storage import PriorityRedisStorage
 from huey.storage import RedisExpireStorage
 from huey.storage import RedisStorage
 from huey.storage import SqliteStorage
+from huey.utils import ChordBranch
 from huey.utils import ChordConfig
 from huey.utils import Error
 from huey.utils import SKIPPED
@@ -333,7 +334,8 @@ class Huey(object):
                 raise ValueError('cannot use `group` as a chord member - '
                                  'use .then() to convert to a `chord` first.')
 
-            config = ChordConfig(cid, size, i, chord_obj.callback)
+            config = ChordConfig(cid, size, i, chord_obj.callback,
+                                 chord_obj.strict)
             results.append(self._enqueue_chord_member(task, config))
 
         if not size:
@@ -518,7 +520,7 @@ class Huey(object):
                 task.on_complete.extend_data(task_value)
                 self.enqueue(task.on_complete)
             if task.chord_config is not None:
-                self._check_chord(task.chord_config, task_value)
+                self._check_chord(task.chord_config, task_value, task)
         else:
             final = not task.retries
             surface = final or (self.store_intermediate_errors and
@@ -547,12 +549,19 @@ class Huey(object):
         # The rest of the pipeline won't run, so report to its chord here.
         while task is not None:
             if task.chord_config is not None:
-                return self._check_chord(task.chord_config, value)
+                return self._check_chord(task.chord_config, value, task)
             task = task.on_complete
 
-    def _check_chord(self, cc, value):
+    def _check_chord(self, cc, value, task=None):
         chord_key = 'chord:%s' % cc.cid
         result_key = 'chord:%s:%s' % (cc.cid, cc.idx)
+        if cc.strict:
+            # Record the member's terminal state, preserving its position in
+            # the chord and task ID, so the callback can distinguish a task
+            # that completed and returned None from one that failed or was
+            # revoked. Members still retrying have not reported yet.
+            value = ChordBranch.build(cc.idx, task.id if task else None,
+                                      value)
         self.put_result(result_key, value)
 
         if self.storage.incr(chord_key) == cc.size:
@@ -1169,9 +1178,13 @@ class group(object):
 
 
 class chord(object):
-    def __init__(self, tasks, callback):
+    def __init__(self, tasks, callback, strict=False):
         self.tasks = tasks
         self.callback = _signature(callback)
+        # When strict, the callback receives a list of ChordBranch records
+        # (input order, task ID and terminal status per member) instead of
+        # the raw result values.
+        self.strict = strict
 
     def then(self, task, *args, **kwargs):
         self.callback.then(task, *args, **kwargs)

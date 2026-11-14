@@ -1441,6 +1441,42 @@ In this example, ``alert_admin`` runs if ``aggregate`` raises an exception,
     ``store_none``.
 
 
+Strict chords
+^^^^^^^^^^^^^
+
+A plain chord hands the callback a list of raw values, which makes it hard to
+tell a member that completed and returned ``None`` apart from one that failed
+or was revoked. Passing ``strict=True`` to :py:class:`chord` changes what the
+callback receives: instead of raw values, it gets a list of
+:py:class:`ChordBranch` records once **every** member has reached a terminal
+state. Members that are still retrying are not counted until their final
+attempt resolves.
+
+Each record preserves the member's input position (``idx``) and ``task_id``,
+and its ``status`` is one of ``ChordBranch.COMPLETE`` (``value`` may be
+``None``), ``ChordBranch.ERROR`` (``value`` is an :py:class:`Error`) or
+``ChordBranch.REVOKED`` (``value`` is ``huey.SKIPPED``):
+
+.. code-block:: python
+
+    from huey import ChordBranch, chord
+
+    @huey.task()
+    def aggregate(branches):
+        for branch in branches:
+            if branch.is_empty:
+                logger.info('%s returned no data', branch.task_id)
+            elif branch.status == ChordBranch.ERROR:
+                logger.warning('%s failed', branch.task_id)
+        return process([b.value for b in branches if b.ok])
+
+    c = chord([fetch.s(u) for u in urls], aggregate.s(), strict=True)
+    result = huey.enqueue(c)
+
+The member :py:class:`Result` handles on :py:class:`ChordResult` are
+unaffected and can be read as usual.
+
+
 Dynamic fan-out
 ^^^^^^^^^^^^^^^
 

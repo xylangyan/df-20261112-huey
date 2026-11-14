@@ -1734,7 +1734,7 @@ Huey object
                 .error(on_fetch_error)
                 .then(aggregate))
 
-.. py:class:: chord(tasks, callback)
+.. py:class:: chord(tasks, callback, strict=False)
 
     A :py:class:`chord` consists of a group of tasks that execute in parallel
     and a callback task. When all sub-tasks have completed (or permanently
@@ -1746,6 +1746,9 @@ Huey object
     :param callback: a ``task()``-decorated function (:py:class:`TaskWrapper`),
         or a :py:class:`Task` instance. The callback receives the list of
         sub-task results as its first argument.
+    :param bool strict: when ``True``, the callback instead receives a list
+        of :py:class:`ChordBranch` records describing each member's terminal
+        state. See **Strict chords** below.
 
     .. code-block:: python
 
@@ -1789,6 +1792,33 @@ Huey object
         Revoking a chord member prevents it from running, but the chord still
         completes. If you need to cancel a chord, revoke the callback task
         instead.
+
+    **Strict chords:**
+
+    With ``strict=True``, the chord still waits for every member to reach a
+    terminal state (members that are retrying are not counted yet), but the
+    callback receives a list of :py:class:`ChordBranch` records instead of
+    raw values. Each record preserves the member's position in the original
+    list and its task ID, and distinguishes a member that completed and
+    returned ``None`` from one that failed permanently or was revoked:
+
+    .. code-block:: python
+
+        @huey.task()
+        def aggregate(branches):
+            for branch in branches:
+                if branch.is_empty:
+                    print(branch.task_id, 'completed with no data')
+                elif branch.status == ChordBranch.ERROR:
+                    print(branch.task_id, 'failed:', branch.value.metadata)
+                elif branch.status == ChordBranch.REVOKED:
+                    print(branch.task_id, 'was revoked')
+
+        c = chord([fetch.s(u) for u in urls], aggregate.s(), strict=True)
+        result = huey.enqueue(c)
+
+    The individual member :py:class:`Result` handles
+    (:py:attr:`ChordResult.results`) are unaffected and can be read as usual.
 
     **Pipeline members:**
 
@@ -1874,6 +1904,48 @@ Huey object
     When the inner chords complete and their callbacks finish, the outer
     chord's callback (``final``) receives the two inner callback results as a
     list. See :ref:`groups-and-chords` in the guide for a detailed example.
+
+
+.. py:class:: ChordBranch(idx, task_id, status, value)
+
+    Terminal-state record for a single member of a strict :py:class:`chord`.
+    The callback of a strict chord receives a list of these records, ordered
+    by the members' positions in the original chord.
+
+    .. py:attribute:: idx
+
+        Position of the member in the original chord task list.
+
+    .. py:attribute:: task_id
+
+        ID of the member task (for pipeline members, the ID of the last task
+        in the pipeline).
+
+    .. py:attribute:: status
+
+        One of:
+
+        * ``ChordBranch.COMPLETE`` - the task finished (``value`` may be
+          ``None``).
+        * ``ChordBranch.ERROR`` - the task failed and exhausted its retries.
+          ``value`` is an :py:class:`Error`.
+        * ``ChordBranch.REVOKED`` - the task never ran (revoked, expired or
+          cancelled by a pre-execute hook). ``value`` is ``huey.SKIPPED``.
+
+    .. py:attribute:: value
+
+        The member's return value, :py:class:`Error` or ``SKIPPED``,
+        depending on ``status``.
+
+    .. py:attribute:: ok
+
+        ``True`` when ``status`` is ``ChordBranch.COMPLETE``.
+
+    .. py:attribute:: is_empty
+
+        ``True`` when the member completed and returned ``None``. This makes
+        it possible to distinguish "completed with an empty result" from
+        "not finished" without inspecting the result store.
 
 
 .. py:class:: ChordResult(results, callback_result, pipeline=None)

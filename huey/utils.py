@@ -33,7 +33,46 @@ class _Skipped(object):
 
 SKIPPED = _Skipped()
 
-ChordConfig = namedtuple('ChordConfig', ('cid', 'size', 'idx', 'callback'))
+ChordConfig = namedtuple('ChordConfig', ('cid', 'size', 'idx', 'callback',
+                                         'strict'))
+ChordConfig.__new__.__defaults__ = (False,)
+
+
+class ChordBranch(namedtuple('ChordBranch', ('idx', 'task_id', 'status',
+                                             'value'))):
+    """
+    Terminal-state record for a single chord member, passed to the callback
+    of a strict chord. Records are ordered by their position in the original
+    chord ("idx") and carry the member task's ID. The "status" is one of:
+
+    * ChordBranch.COMPLETE - the task finished (value may be None).
+    * ChordBranch.ERROR - the task failed and exhausted its retries.
+    * ChordBranch.REVOKED - the task was revoked, expired or canceled.
+    """
+    __slots__ = ()
+
+    COMPLETE = 'complete'
+    ERROR = 'error'
+    REVOKED = 'revoked'
+
+    @property
+    def ok(self):
+        return self.status == ChordBranch.COMPLETE
+
+    @property
+    def is_empty(self):
+        # Distinguishes a task that completed and returned None.
+        return self.status == ChordBranch.COMPLETE and self.value is None
+
+    @classmethod
+    def build(cls, idx, task_id, value):
+        if isinstance(value, Error):
+            status = cls.ERROR
+        elif value is SKIPPED:
+            status = cls.REVOKED
+        else:
+            status = cls.COMPLETE
+        return cls(idx, task_id, status, value)
 
 
 def load_class(s):

@@ -25,6 +25,7 @@ from huey.exceptions import TaskLockedException
 from huey.exceptions import TaskTimeout
 from huey.serializer import SignedSerializer
 from huey.tests.base import BaseTestCase
+from huey.utils import ChordBranch
 from huey.utils import Error
 from huey.utils import SKIPPED
 
@@ -2261,6 +2262,114 @@ class TestChordPrimitive(BaseTestCase):
         self.assertEqual(self.execute_next(), ['a', 'b', 'c'])
 
         self.assertEqual(result(), ['a', 'b', 'c'])
+
+    def test_chord_strict_branch_records(self):
+        # A strict chord waits for every member to reach a terminal state,
+        # then the callback receives ChordBranch records (input order, task
+        # ID and status) instead of raw values.
+        calls = []
+        attempts = [0]
+
+        @self.huey.task(retries=1)
+        def flaky(n):
+            attempts[0] += 1
+            if attempts[0] == 1:
+                raise TestError('transient')
+            return n
+
+        @self.huey.task()
+        def empty():
+            return None
+
+        @self.huey.task()
+        def agg(branches):
+            calls.append([(b.idx, b.status) for b in branches])
+            return branches
+
+        c = chord([flaky.s('a'), empty.s(), flaky.s('c')], agg.s(),
+                  strict=True)
+        r = self.huey.enqueue(c)
+        self.assertEqual(len(self.huey), 3)
+
+        members = list(r.results)
+        members[2].revoke()  # Revoke the last member.
+
+        t0 = self.huey.dequeue()
+        t1 = self.huey.dequeue()
+        t2 = self.huey.dequeue()
+
+        # The last-submitted member reaches its terminal state first.
+        self.assertTrue(self.huey.execute(t2) is None)  # Revoked, not run.
+        self.assertEqual(len(self.huey), 0)  # No callback yet.
+
+        # The first member fails, but a retry remains: the chord does not
+        # count the branch yet and no callback is enqueued.
+        self.assertTrue(self.huey.execute(t0) is None)
+        self.assertEqual(len(self.huey), 1)  # Just the re-enqueued retry.
+
+        # The middle member completes with an empty (None) result.
+        self.assertTrue(self.huey.execute(t1) is None)
+        self.assertEqual(len(self.huey), 1)  # Still just the retry.
+
+        # The retry succeeds: all members are terminal, callback enqueued.
+        self.assertEqual(self.huey.execute(self.huey.dequeue()), 'a')
+        self.assertEqual(len(self.huey), 1)
+
+        branches = self.execute_next()
+        self.assertEqual(len(self.huey), 0)
+
+        # The callback ran exactly once, with records in input order.
+        self.assertEqual(calls, [[(0, ChordBranch.COMPLETE),
+                                  (1, ChordBranch.COMPLETE),
+                                  (2, ChordBranch.REVOKED)]])
+
+        b0, b1, b2 = branches
+        self.assertEqual([b.task_id for b in branches],
+                         [m.id for m in members])
+        self.assertEqual(b0.value, 'a')
+        self.assertTrue(b0.ok)
+        self.assertTrue(b1.is_empty)  # Completed and returned None.
+        self.assertTrue(b1.value is None)
+        self.assertFalse(b2.ok)
+        self.assertTrue(b2.value is SKIPPED)
+
+        # The individual result handles are unaffected.
+        self.assertEqual(r()[0].value, 'a')
+        self.assertEqual(members[0].get(), 'a')
+
+    def test_chord_strict_error_branch(self):
+        @self.huey.task()
+        def ok():
+            return 1
+
+        @self.huey.task()
+        def bad():
+            raise TestError('nope')
+
+        @self.huey.task()
+        def agg(branches):
+            return branches
+
+        r = self.huey.enqueue(chord([ok.s(), bad.s()], agg.s(), strict=True))
+        self.assertEqual(self.execute_next(), 1)
+        self.assertTrue(self.execute_next() is None)  # bad() fails, 0 retries.
+
+        b_ok, b_bad = self.execute_next()
+        self.assertEqual((b_ok.idx, b_ok.status, b_ok.value),
+                         (0, ChordBranch.COMPLETE, 1))
+        self.assertEqual(b_bad.idx, 1)
+        self.assertEqual(b_bad.status, ChordBranch.ERROR)
+        self.assertTrue(isinstance(b_bad.value, Error))
+        self.assertEqual(b_bad.value.metadata['error'], 'TestError(nope)')
+
+    def test_chord_strict_empty(self):
+        @self.huey.task()
+        def agg(branches):
+            return branches
+
+        r = self.huey.enqueue(chord([], agg.s(), strict=True))
+        self.assertEqual(self.execute_next(), [])
+        self.assertEqual(r(), [])
 
     def test_chord_scheduling(self):
         @self.huey.task()
