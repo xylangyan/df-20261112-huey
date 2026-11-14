@@ -4,6 +4,7 @@ import inspect
 import itertools
 import logging
 import re
+import threading
 import time
 import traceback
 import uuid
@@ -19,6 +20,7 @@ from huey.consumer import Consumer
 from huey.exceptions import CancelExecution
 from huey.exceptions import ConfigurationError
 from huey.exceptions import RateLimitExceeded
+from huey.exceptions import ResourceLimitExceeded
 from huey.exceptions import RETRYING_EXCEPTIONS
 from huey.exceptions import ResultTimeout
 from huey.exceptions import RetryTask
@@ -777,6 +779,10 @@ class Huey(object):
     def rate_limit(self, name, limit, per, retry=True):
         return RateLimit(self, name, limit, per, retry=retry)
 
+    def resource_limit(self, name, limit, ttl=None, retry=True, retry_delay=1):
+        return ResourceLimit(self, name, limit, ttl=ttl, retry=retry,
+                             retry_delay=retry_delay)
+
     def _result_handle(self, task):
         return Result(self, task)
 
@@ -1153,6 +1159,58 @@ class RateLimit(object):
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         pass
+
+
+class ResourceLimit(object):
+    """
+    Utilize the Storage slot APIs to limit the number of tasks concurrently
+    holding a named resource. Multiple task functions can share the same
+    capacity by using the same resource name.
+    """
+    def __init__(self, huey, name, limit, ttl=None, retry=True, retry_delay=1):
+        self._huey = huey
+        self._name = name
+        self._limit = limit
+        self._ttl = ttl
+        self._retry = retry
+        self._retry_delay = retry_delay
+        self._key = '%s.res.%s' % (self._huey.name, self._name)
+        self._local = threading.local()
+
+    @property
+    def _tokens(self):
+        # Tokens are tracked per-thread (or greenlet, when monkey-patched) so
+        # that a shared instance is safe to use from concurrent tasks.
+        try:
+            return self._local.tokens
+        except AttributeError:
+            self._local.tokens = tokens = []
+            return tokens
+
+    def acquire(self):
+        token = uuid.uuid4().hex
+        if not self._huey.storage.acquire_slot(self._key, token, self._limit,
+                                               self._ttl):
+            raise ResourceLimitExceeded(self._name, self._retry_delay,
+                                        retry=self._retry)
+        return token
+
+    def release(self, token):
+        return self._huey.storage.release_slot(self._key, token)
+
+    def __call__(self, fn):
+        @wraps(fn)
+        def inner(*args, **kwargs):
+            with self:
+                return fn(*args, **kwargs)
+        return inner
+
+    def __enter__(self):
+        self._tokens.append(self.acquire())
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release(self._tokens.pop())
 
 
 class group(object):

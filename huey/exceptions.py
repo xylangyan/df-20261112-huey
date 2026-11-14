@@ -15,6 +15,13 @@ class RateLimitExceeded(HueyException):
                 self.key, self.delay)
         return 'Rate limit exceeded on "%s"' % self.key
 
+class ResourceLimitExceeded(RateLimitExceeded):
+    def __str__(self):
+        if self.retry:
+            return 'Resource limit exceeded on "%s", retry in %0.1fs' % (
+                self.key, self.delay)
+        return 'Resource limit exceeded on "%s"' % self.key
+
 class CancelExecution(Exception):
     def __init__(self, msg=None, retry=None):
         self.retry = retry

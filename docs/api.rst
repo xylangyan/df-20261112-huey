@@ -1071,6 +1071,56 @@ Huey object
         In the above code, if the task fails due to being rate-limited, it will
         be retried up to 2 times after a delay of 120s between retries.
 
+    .. py:method:: resource_limit(name, limit, ttl=None, retry=True, retry_delay=1)
+
+        :param str name: Name of the resource being limited.
+        :param int limit: Maximum number of tasks concurrently holding the
+            resource.
+        :param float ttl: Seconds after which a held slot's lease expires and
+            can be reclaimed (e.g. when the holder was killed). No expiration
+            by default.
+        :param bool retry: Automatically reschedule tasks that cannot acquire
+            a slot. The rescheduling does not count against the task's own
+            ``retries``.
+        :param float retry_delay: Seconds to wait before re-attempting a
+            throttled task (unless the task specifies its own ``retry_delay``).
+        :returns: :py:class:`ResourceLimit` instance, which can be used as a
+            decorator or context-manager.
+
+        Limit the number of tasks concurrently holding a named resource.
+        Unlike :py:meth:`~Huey.lock_task`, which allows a single holder, a
+        resource limit acts as a semaphore with the given capacity. Since the
+        limit is keyed by resource name, multiple task functions can share
+        the same capacity:
+
+        .. code-block:: python
+
+            upstream = huey.resource_limit('upstream', limit=2, ttl=300)
+
+            @huey.task(retries=3)
+            @upstream
+            def sync_directory(url):
+                ...
+
+            @huey.task(retries=3)
+            @upstream
+            def sync_detail(url):
+                ...
+
+        When no slot is available, :py:class:`ResourceLimitExceeded` is
+        raised and the task is scheduled to run again after ``retry_delay``
+        seconds, without consuming the task's own retries and without
+        blocking the consumer. Slots are released when the task finishes,
+        whether or not it raised an exception.
+
+        Slots are leases identified by unique tokens. A slot whose lease
+        expires (``ttl``) can be reclaimed by another task, and a late
+        release by the previous holder will not free the re-lent slot.
+
+        .. note::
+            Resource limits are currently supported by the memory and sqlite
+            storages. Other storages raise ``NotImplementedError``.
+
     .. py:method:: put(key, data)
 
         :param key: key for data

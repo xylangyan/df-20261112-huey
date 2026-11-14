@@ -263,7 +263,55 @@ class StorageTests(object):
             self.assertTrue(task_a.restore())
 
 
-class TestMemoryStorage(StorageTests, BaseTestCase):
+class SlotStorageTests(object):
+    # Mixin for storages implementing the slot (capacity lease) APIs.
+    def test_slot_acquire_release(self):
+        s = self.s
+        self.assertTrue(s.acquire_slot('k', 't1', 2))
+        self.assertTrue(s.acquire_slot('k', 't2', 2))
+        self.assertFalse(s.acquire_slot('k', 't3', 2))  # At capacity.
+
+        # A different key has its own capacity.
+        self.assertTrue(s.acquire_slot('k2', 't4', 2))
+
+        # Release is token-scoped: an unknown token frees nothing.
+        self.assertFalse(s.release_slot('k', 'tx'))
+        self.assertFalse(s.acquire_slot('k', 't3', 2))
+
+        self.assertTrue(s.release_slot('k', 't1'))
+        self.assertTrue(s.acquire_slot('k', 't3', 2))
+        self.assertFalse(s.release_slot('k', 't1'))  # Already released.
+
+    def test_slot_expiry_and_fencing(self):
+        s = self.s
+        self.assertTrue(s.acquire_slot('k', 'old', 2, ttl=0.05))
+        self.assertTrue(s.acquire_slot('k', 'keep', 2, ttl=60))
+        self.assertFalse(s.acquire_slot('k', 'new', 2))
+
+        time.sleep(0.06)  # The "old" lease expires.
+
+        # The expired lease is reclaimed...
+        self.assertTrue(s.acquire_slot('k', 'new', 2, ttl=60))
+
+        # ...and the stale holder's late release cannot free the re-lent slot.
+        self.assertFalse(s.release_slot('k', 'old'))
+        self.assertFalse(s.acquire_slot('k', 'other', 2))
+
+        self.assertTrue(s.release_slot('k', 'new'))
+        self.assertTrue(s.release_slot('k', 'keep'))
+
+    def test_flush_slots(self):
+        self.assertTrue(self.s.acquire_slot('k', 't1', 1))
+        self.s.flush_slots()
+        self.assertTrue(self.s.acquire_slot('k', 't2', 1))
+
+    def test_flush_all_clears_slots(self):
+        self.assertTrue(self.s.acquire_slot('k', 't1', 1))
+        self.s.flush_all()
+        self.assertTrue(self.s.acquire_slot('k', 't2', 1))
+
+
+class TestMemoryStorage(SlotStorageTests, StorageTests, BaseTestCase):
     def get_huey(self):
         return MemoryHuey(utc=False)
 
@@ -500,7 +548,7 @@ class TestRedisStorageOffline(BaseTestCase):
         self.assertEqual(calls, [(0, -1), (-3, -1)])
 
 
-class TestSqliteStorage(StorageTests, BaseTestCase):
+class TestSqliteStorage(SlotStorageTests, StorageTests, BaseTestCase):
     supports_ttl = False
 
     def tearDown(self):
@@ -613,7 +661,7 @@ class TestSqliteStorage(StorageTests, BaseTestCase):
 
 
 @unittest.skipIf(cysqlite is None, 'requires cysqlite')
-class TestCySqliteStorage(StorageTests, BaseTestCase):
+class TestCySqliteStorage(SlotStorageTests, StorageTests, BaseTestCase):
     supports_ttl = False
 
     def tearDown(self):
@@ -683,6 +731,11 @@ class TestFileStorageMethods(StorageTests, BaseTestCase):
         self.s.enqueue(b'high', priority=2.5)
         self.assertEqual(self.s.dequeue(), b'high')
         self.assertEqual(self.s.dequeue(), b'low')
+
+    def test_slots_unsupported(self):
+        self.assertRaises(NotImplementedError, self.s.acquire_slot,
+                          'k', 't1', 1)
+        self.assertRaises(NotImplementedError, self.s.release_slot, 'k', 't1')
 
     def get_huey(self):
         return Huey('test-file-storage', storage_class=FileStorage,

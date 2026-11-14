@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import inspect
 import pickle
+import threading
 import time
 
 from huey.api import ChordResult
@@ -17,6 +18,7 @@ from huey.api import group
 from huey.constants import EmptyData
 from huey.exceptions import CancelExecution
 from huey.exceptions import RateLimitExceeded
+from huey.exceptions import ResourceLimitExceeded
 from huey.exceptions import ResultTimeout
 from huey.exceptions import ConfigurationError
 from huey.exceptions import RetryTask
@@ -2866,6 +2868,230 @@ class TestRateLimit(BaseTestCase):
         self.assertEqual(task.retries, 1)  # Task retries decremented.
         self.assertEqual(task.retry_delay, 10)  # Task retains retry delay.
         self.huey.storage.flush_schedule()
+
+
+class TestResourceLimit(BaseTestCase):
+    def make_tasks(self, completed, limit=2, **kwargs):
+        upstream = self.huey.resource_limit('upstream', limit=limit, **kwargs)
+
+        @self.huey.task(retries=1)
+        @upstream
+        def fetch_dir(n):
+            completed.append('dir-%s' % n)
+            return n
+
+        @self.huey.task(retries=1)
+        @upstream
+        def fetch_detail(n):
+            completed.append('detail-%s' % n)
+            return n
+
+        @self.huey.task()
+        def control(n):
+            completed.append('ctl-%s' % n)
+            return n
+
+        return upstream, fetch_dir, fetch_detail, control
+
+    def test_shared_capacity(self):
+        # Two task functions share a single capacity limit, while a control
+        # task is unaffected. Throttled tasks are requeued for later without
+        # consuming their own retries and without blocking the consumer.
+        completed = []
+        upstream, fetch_dir, fetch_detail, control = self.make_tasks(
+            completed, retry_delay=60)
+
+        # Both slots are held, e.g. by invocations running on other workers.
+        held = [upstream.acquire(), upstream.acquire()]
+
+        r1 = fetch_dir(1)
+        r2 = fetch_detail(2)
+        r3 = control(3)
+
+        # The limited tasks are throttled, but the consumer is not blocked:
+        # the unlimited control task behind them still runs.
+        self.assertTrue(self.execute_next() is None)
+        self.assertTrue(self.execute_next() is None)
+        self.assertEqual(self.execute_next(), 3)
+
+        # The throttled tasks are requeued via the schedule with their
+        # business retries untouched, and nothing is stored for them yet.
+        self.assertEqual(self.huey.scheduled_count(), 2)
+        by_id = dict((t.id, t) for t in self.huey.scheduled())
+        self.assertEqual(set(by_id), set([r1.id, r2.id]))
+        self.assertEqual(by_id[r1.id].retries, 1)
+        self.assertEqual(by_id[r2.id].retries, 1)
+        self.assertTrue(r1.get() is None)
+        self.assertTrue(r2.get() is None)
+
+        # Once the slots are released the throttled tasks run to completion.
+        for token in held:
+            upstream.release(token)
+        eta = datetime.datetime.now() + datetime.timedelta(seconds=61)
+        self.assertEqual(self.huey.execute(by_id[r1.id], eta), 1)
+        self.assertEqual(self.huey.execute(by_id[r2.id], eta), 2)
+
+        self.assertEqual(completed, ['ctl-3', 'dir-1', 'detail-2'])
+        self.assertEqual(self.huey.storage._slots, {})  # All slots released.
+
+    def test_concurrent_execution_cap(self):
+        # Genuinely concurrent invocations of both task types: no more than
+        # `limit` may hold the resource at once, the rest are rescheduled,
+        # and the control task is unaffected.
+        completed = []
+        upstream = self.huey.resource_limit('upstream', limit=2, retry_delay=60)
+        state = {'cur': 0, 'max': 0}
+        lock = threading.Lock()
+        gate = threading.Event()
+
+        def track(label, n):
+            with lock:
+                state['cur'] += 1
+                state['max'] = max(state['max'], state['cur'])
+            try:
+                gate.wait(5)
+                completed.append('%s-%s' % (label, n))
+            finally:
+                with lock:
+                    state['cur'] -= 1
+            return n
+
+        @self.huey.task()
+        @upstream
+        def fetch_dir(n):
+            return track('dir', n)
+
+        @self.huey.task()
+        @upstream
+        def fetch_detail(n):
+            return track('detail', n)
+
+        @self.huey.task()
+        def control(n):
+            completed.append('ctl-%s' % n)
+            return n
+
+        fetch_dir(1)
+        fetch_detail(2)
+        fetch_dir(3)
+        fetch_detail(4)
+        control(5)
+        queued = [self.huey.dequeue() for _ in range(5)]
+
+        threads = [threading.Thread(target=self.huey.execute, args=(task,))
+                   for task in queued]
+        for thread in threads:
+            thread.start()
+
+        # Wait until both slots are held and the two remaining limited tasks
+        # have been rescheduled (or the cap is broken and we can fail fast).
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            with lock:
+                max_seen = state['max']
+            if max_seen > 2:
+                break  # Cap was not enforced.
+            if max_seen == 2 and self.huey.scheduled_count() == 2:
+                break
+            time.sleep(0.01)
+        gate.set()
+        for thread in threads:
+            thread.join()
+
+        # The capacity was never exceeded, two tasks were throttled, and the
+        # control task ran straight through.
+        self.assertEqual(state['max'], 2)
+        self.assertEqual(self.huey.scheduled_count(), 2)
+        self.assertEqual(len(completed), 3)
+        self.assertIn('ctl-5', completed)
+
+        # The throttled tasks run once slots are available again.
+        eta = datetime.datetime.now() + datetime.timedelta(seconds=61)
+        for task in self.huey.read_schedule(eta):
+            self.huey.execute(task, eta)
+        self.assertEqual(sorted(completed), [
+            'ctl-5', 'detail-2', 'detail-4', 'dir-1', 'dir-3'])
+        self.assertEqual(self.huey.storage._slots, {})
+
+    def test_exception_releases_slot(self):
+        calls = []
+        upstream = self.huey.resource_limit('upstream', limit=1)
+
+        @self.huey.task(retries=1)
+        @upstream
+        def flaky(n):
+            calls.append(n)
+            if len(calls) == 1:
+                raise TestError('boom')
+            return n
+
+        r = flaky(1)
+        self.assertTrue(self.execute_next() is None)  # Error, slot released.
+
+        # The retry is re-enqueued and can immediately re-acquire the slot,
+        # i.e. the failed attempt did not leak it.
+        self.assertEqual(self.huey.scheduled_count(), 0)
+        self.assertEqual(self.execute_next(), 1)
+        self.assertEqual(r.get(), 1)
+        self.assertEqual(calls, [1, 1])
+        self.assertEqual(self.huey.storage._slots, {})
+
+    def test_stale_holder_cannot_release_relent_slot(self):
+        # A holder that disappears leaves its lease to expire. The reclaimed
+        # slot is re-lent, and the old holder's late release must not return
+        # a slot that now belongs to someone else.
+        expiring = self.huey.resource_limit('upstream', limit=2, ttl=0.05)
+        pool = self.huey.resource_limit('upstream', limit=2, ttl=60)
+
+        stale = expiring.acquire()  # Old holder takes a slot, then disappears.
+        keeper = pool.acquire()  # Second slot is held by a live holder.
+
+        # Capacity is reached.
+        self.assertRaises(ResourceLimitExceeded, pool.acquire)
+
+        time.sleep(0.06)  # The stale holder's lease expires.
+
+        # A new task borrows the reclaimed slot.
+        token = pool.acquire()
+
+        # The old holder's late release cannot return the re-lent slot.
+        self.assertFalse(expiring.release(stale))
+
+        # Capacity is still fully consumed by the two live holders.
+        self.assertRaises(ResourceLimitExceeded, pool.acquire)
+
+        self.assertTrue(pool.release(token))
+        self.assertTrue(pool.release(keeper))
+        self.assertFalse(pool.release(keeper))  # Already released.
+
+    def test_retry_false(self):
+        upstream = self.huey.resource_limit('upstream', limit=1, retry=False)
+
+        @self.huey.task()
+        @upstream
+        def task_a(n):
+            return n + 1
+
+        token = upstream.acquire()  # Hold the only slot.
+        r = task_a(1)
+        self.assertTrue(self.execute_next() is None)
+        err = self.trap_exception(r)
+        self.assertTrue('ResourceLimitExceeded' in err.metadata['error'])
+        self.assertEqual(self.huey.scheduled_count(), 0)  # Not requeued.
+        self.assertTrue(upstream.release(token))
+
+    def test_ctx_manager(self):
+        upstream = self.huey.resource_limit('upstream', limit=1)
+
+        @self.huey.task()
+        def task_a(n):
+            with upstream:
+                return n + 1
+
+        r = task_a(1)
+        self.assertEqual(self.execute_next(), 2)
+        self.assertEqual(r.get(), 2)
+        self.assertEqual(self.huey.storage._slots, {})
 
 
 class TestHueyAPIs(BaseTestCase):

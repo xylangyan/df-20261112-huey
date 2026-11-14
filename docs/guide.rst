@@ -962,6 +962,63 @@ Equivalent example using a context-manager instead of a decorator:
 
 See :py:meth:`Huey.rate_limit` for API documentation.
 
+.. _resource-limits:
+
+Resource limits
+---------------
+
+Where :py:meth:`~Huey.lock_task` allows a single holder and
+:py:meth:`~Huey.rate_limit` caps invocations within a time window,
+:py:meth:`~Huey.resource_limit` caps the number of tasks *concurrently
+holding* a named resource. Because the limit is keyed by resource name,
+different task functions can share the same capacity - for example, directory
+and detail sync tasks that must not exceed two connections to the same
+upstream server:
+
+.. code-block:: python
+
+    # Both task functions draw from the same pool of 2 connections.
+    upstream = huey.resource_limit('mirror-upstream', limit=2, ttl=300)
+
+    @huey.task(retries=3)
+    @upstream
+    def sync_directory(url):
+        ...
+
+    @huey.task(retries=3)
+    @upstream
+    def sync_detail(url):
+        ...
+
+When no slot is available, a :py:class:`ResourceLimitExceeded` exception is
+raised. Like a rate-limited task, the throttled task is scheduled to run
+again after a short delay (``retry_delay``, default 1s) - it is **not**
+counted against the task's own ``retries``, and the consumer is free to work
+on other tasks in the meantime. Slots are always released when the task
+finishes, whether it succeeded or raised an exception.
+
+Each slot is a lease identified by a unique token:
+
+* Pass ``ttl`` (seconds) so a slot left behind by a killed worker is
+  reclaimed automatically once the lease expires.
+* A late release by a stale holder (whose lease expired and was re-lent to
+  another task) is ignored, so it cannot free a slot it no longer owns.
+
+The equivalent context-manager form:
+
+.. code-block:: python
+
+    @huey.task(retries=3)
+    def sync_detail(url):
+        with huey.resource_limit('mirror-upstream', limit=2, ttl=300):
+            ...
+
+.. note::
+    Resource limits are currently supported by the memory and sqlite
+    storages. Other storages raise ``NotImplementedError``.
+
+See :py:meth:`Huey.resource_limit` for API documentation.
+
 Task pipelines
 --------------
 
