@@ -5,6 +5,13 @@ Changelog
 
 [View commits](https://github.com/coleifer/huey/compare/3.5.4...master)
 
+* Add optional claim (lease) mode to `SqliteHuey`/`CySqliteHuey`. Enable with
+  `claim_mode=True` so dequeue reserves a row with an expiring lease instead of
+  deleting it, providing at-least-once delivery when a consumer crashes. Tasks
+  are acknowledged via `Huey.ack()`, leases can be renewed with
+  `Huey.renew_lease()`, and expired leases are re-claimed by another consumer.
+  Token fencing rejects a late ack/renewal from a consumer that lost its lease.
+
 ## 3.5.4
 
 * Fix possible hang if worker holding the stop flag was killed while holding

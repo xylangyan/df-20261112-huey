@@ -33,8 +33,11 @@ from huey.api import RedisHuey
 from huey.api import SqliteHuey
 from huey.api import chord
 from huey.constants import EmptyData
+from huey.exceptions import CancelExecution
 from huey.exceptions import ConfigurationError
+from huey.exceptions import RetryTask
 from huey.storage import FileStorage
+from huey.storage import Lease
 from huey.tests.base import BaseTestCase
 from huey.tests.base import CI
 from huey.tests.base import slow_test
@@ -610,6 +613,227 @@ class TestSqliteStorage(StorageTests, BaseTestCase):
                                    ('index', 'task'))
         self.assertEqual([r[0] for r in curs.fetchall()],
                          ['task_queue_priority_id'])
+
+
+class FakeClock(object):
+    def __init__(self, start=1000.0):
+        self.now = start
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class TestSqliteClaimStorage(BaseTestCase):
+    filename = 'huey_claim.db'
+    ttl = 30.0
+
+    def tearDown(self):
+        super(TestSqliteClaimStorage, self).tearDown()
+        for suffix in ('', '-wal', '-shm'):
+            if os.path.exists(self.filename + suffix):
+                os.unlink(self.filename + suffix)
+
+    def get_huey(self):
+        self.clock = FakeClock()
+        return SqliteHuey(filename=self.filename, claim_mode=True,
+                          lease_ttl=self.ttl, clock=self.clock, utc=False,
+                          journal_mode=None, results=False)
+
+    def other_huey(self):
+        return SqliteHuey(filename=self.filename, claim_mode=True,
+                          lease_ttl=self.ttl, clock=self.clock, utc=False,
+                          journal_mode=None, results=False)
+
+    def test_dequeue_returns_lease_and_hides_claimed(self):
+        self.s.enqueue(b'a')
+        data, lease = self.s.dequeue()
+        self.assertEqual(data, b'a')
+        self.assertIsInstance(lease, Lease)
+        # The row is retained but no longer claimable while the lease is held.
+        self.assertEqual(self.s.queue_size(), 0)
+        self.assertEqual(self.s.enqueued_items(), [])
+        self.assertTrue(self.s.claim_held(lease))
+
+    def test_contention_only_one_consumer_wins(self):
+        other = self.other_huey().storage
+        try:
+            self.s.enqueue(b'a')
+            first = self.s.dequeue()
+            self.assertIsNotNone(first)
+            # A second consumer cannot take a row that is still leased.
+            self.assertTrue(other.dequeue() is None)
+            self.assertTrue(self.s.ack(first[1]))
+            self.assertTrue(other.dequeue() is None)
+        finally:
+            other.close()
+
+    def test_expired_lease_is_reclaimed_with_new_token(self):
+        other = self.other_huey().storage
+        try:
+            self.s.enqueue(b'a')
+            data, first_lease = self.s.dequeue()
+            self.assertEqual(data, b'a')
+
+            self.clock.advance(self.ttl + 1)
+            self.assertEqual(self.s.queue_size(), 1)
+            taken = other.dequeue()
+            self.assertIsNotNone(taken)
+            data2, second_lease = taken
+            self.assertEqual(data2, b'a')
+            self.assertEqual(second_lease.id, first_lease.id)
+            self.assertNotEqual(second_lease.token, first_lease.token)
+        finally:
+            other.close()
+
+    def test_stale_ack_and_renewal_are_rejected(self):
+        other = self.other_huey().storage
+        try:
+            self.s.enqueue(b'a')
+            _, first_lease = self.s.dequeue()
+            self.clock.advance(self.ttl + 1)
+            _, second_lease = other.dequeue()
+
+            # The original holder can no longer ack, renew or release the row.
+            self.assertFalse(self.s.ack(first_lease))
+            self.assertFalse(self.s.renew_lease(first_lease))
+            self.assertFalse(self.s.release_claim(first_lease))
+            # The new holder's row survives the stale ack.
+            self.assertTrue(other.claim_held(second_lease))
+            self.assertTrue(other.ack(second_lease))
+            self.assertEqual(other.queue_size(), 0)
+        finally:
+            other.close()
+
+    def test_renewal_keeps_lease_alive(self):
+        other = self.other_huey().storage
+        try:
+            self.s.enqueue(b'a')
+            _, lease = self.s.dequeue()
+            self.clock.advance(self.ttl - 1)
+            self.assertTrue(self.s.renew_lease(lease))
+            self.clock.advance(self.ttl - 1)
+            # Without renewal this would have expired; it is still held.
+            self.assertTrue(self.s.claim_held(lease))
+            self.assertTrue(other.dequeue() is None)
+        finally:
+            other.close()
+
+    def test_release_makes_row_claimable_again(self):
+        self.s.enqueue(b'a')
+        _, lease = self.s.dequeue()
+        self.assertEqual(self.s.queue_size(), 0)
+        self.assertTrue(self.s.release_claim(lease))
+        self.assertEqual(self.s.queue_size(), 1)
+        data, new_lease = self.s.dequeue()
+        self.assertEqual(data, b'a')
+        self.assertNotEqual(new_lease.token, lease.token)
+
+    def test_claim_ordering_preserves_priority_and_fifo(self):
+        self.s.enqueue(b'p0-a')
+        self.s.enqueue(b'p5', priority=5)
+        self.s.enqueue(b'p0-b')
+        self.s.enqueue(b'p3', priority=3)
+
+        data, _ = self.s.dequeue()
+        self.assertEqual(data, b'p5')
+        data, _ = self.s.dequeue()
+        self.assertEqual(data, b'p3')
+        data, _ = self.s.dequeue()
+        self.assertEqual(data, b'p0-a')
+        data, _ = self.s.dequeue()
+        self.assertEqual(data, b'p0-b')
+
+    def test_claims_are_delivered_once_under_contention(self):
+        nthreads, ntasks = 8, 50
+        for i in range(nthreads * ntasks):
+            self.s.enqueue(b'%d' % i)
+
+        claimed = []
+        lock = threading.Lock()
+
+        def claim_and_ack():
+            while True:
+                result = self.s.dequeue()
+                if result is None:
+                    return
+                data, lease = result
+                self.assertTrue(self.s.ack(lease))
+                with lock:
+                    claimed.append(int(data))
+
+        threads = [threading.Thread(target=claim_and_ack)
+                   for _ in range(nthreads)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10.)
+
+        # Every row was claimed exactly once and then removed.
+        self.assertEqual(sorted(claimed), list(range(nthreads * ntasks)))
+        self.assertEqual(self.s.queue_size(), 0)
+
+    def test_huey_ack_renew_release_and_consumer_paths(self):
+        @self.huey.task(retries=1)
+        def flaky(photo_id):
+            if not getattr(flaky, '_failed', False):
+                flaky._failed = True
+                raise RetryTask('transient')
+            return 'ok %s' % photo_id
+
+        @self.huey.task()
+        def canceled(photo_id):
+            raise CancelExecution('abort')
+
+        # Retry: the claimed row is acked after a fresh retry row is enqueued.
+        flaky('p1')
+        first = self.huey.dequeue()
+        lease = first._lease
+        self.huey.execute(first, self.huey._get_timestamp())
+        self.assertFalse(self.s.claim_held(lease))
+        retried = self.huey.dequeue()
+        self.assertIsNotNone(retried)
+        self.huey.execute(retried, self.huey._get_timestamp())
+        self.assertEqual(self.huey.pending_count(), 0)
+
+        # Cancel without retries: the row is acked and dropped immediately.
+        canceled('p2')
+        canceled_task = self.huey.dequeue()
+        cancel_lease = canceled_task._lease
+        self.huey.execute(canceled_task, self.huey._get_timestamp())
+        self.assertFalse(self.s.claim_held(cancel_lease))
+        self.assertEqual(self.huey.pending_count(), 0)
+
+    def test_legacy_schema_gets_claim_columns(self):
+        # Create a database with the old, claim-less task table.
+        path = self.filename
+        self.s.close()
+        for suffix in ('', '-wal', '-shm'):
+            if os.path.exists(path + suffix):
+                os.unlink(path + suffix)
+        conn = sqlite3.connect(path)
+        conn.execute('create table task (id integer not null primary key, '
+                     'queue text not null, data blob not null, '
+                     'priority real not null default 0.0)')
+        conn.execute("insert into task (queue, data, priority) values "
+                     "('huey', x'01', 0)")
+        conn.commit()
+        conn.close()
+
+        # Re-opening in claim mode migrates the table and claims the old row.
+        migrated = SqliteHuey(filename=path, claim_mode=True,
+                              lease_ttl=self.ttl, clock=self.clock,
+                              journal_mode=None).storage
+        try:
+            columns = {row[1] for row in
+                       migrated.sql('pragma table_info(task)', results=True)}
+            self.assertIn('claim_token', columns)
+            self.assertIn('claim_expires', columns)
+            self.assertIsNotNone(migrated.dequeue())
+        finally:
+            migrated.close()
 
 
 @unittest.skipIf(cysqlite is None, 'requires cysqlite')

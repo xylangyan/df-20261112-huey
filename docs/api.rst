@@ -133,6 +133,15 @@ Huey types
         corruption in the event of sudden power loss. By default will use the
         SQLite library's ``synchronous`` setting (typically ``1``, which
         provides a good balance between durability and performance).
+    :param bool claim_mode: opt in to lease-based "claim" semantics instead of
+        the default delete-on-dequeue. Defaults to false, preserving the
+        historical behavior. See :ref:`sqlite_claim_mode`.
+    :param float lease_ttl: seconds a claimed row is reserved for its consumer
+        before another consumer may take it over. Only used when
+        ``claim_mode=True``. Defaults to 60.
+    :param callable clock: zero-argument callable returning the current time
+        in seconds, used for lease expiry. Defaults to :func:`time.time`;
+        inject a controllable clock for testing.
 
     SqliteHuey fully supports task priorities.
 

@@ -1675,6 +1675,75 @@ Storage Options
     All storage methods are no-ops.
 
 
+.. _sqlite_claim_mode:
+
+Sqlite claim mode (at-least-once delivery)
+------------------------------------------
+
+By default :py:class:`SqliteHuey` deletes a queue row the moment a consumer
+dequeues it. If that consumer process dies after taking the row but before
+finishing the task, the task is lost. To avoid this, the Sqlite storage layer
+offers an optional **claim mode** that keeps the row and reserves it with an
+expiring lease:
+
+.. code-block:: python
+
+    from huey import SqliteHuey
+
+    huey = SqliteHuey('photo-index', filename='indexing.db',
+                      claim_mode=True, lease_ttl=60)
+
+The default (``claim_mode=False``) is unchanged, so existing deployments keep
+the delete-on-dequeue behavior and only opt in when they configure it.
+
+How it works
+^^^^^^^^^^^^
+
+* ``dequeue()`` no longer deletes the row. It atomically marks the highest
+  priority, oldest claimable row with a random claim token and an expiry of
+  ``now + lease_ttl``, then returns the data together with a
+  :py:class:`~huey.storage.Lease`. Ordering is unchanged: priority first
+  (``priority desc``), then insertion order (``id``).
+* While a lease is unexpired no other consumer can take the row, and it is not
+  counted by :py:meth:`Huey.pending_count` or returned by
+  :py:meth:`Huey.pending`.
+* When the work is finished the consumer acknowledges with
+  :py:meth:`Huey.ack`, which deletes the row. A long-running task can call
+  :py:meth:`Huey.renew_lease` to push the expiry out, or
+  :py:meth:`Huey.release_claim` to give the row back immediately.
+* If the holder dies, the lease expires and another consumer re-claims the same
+  row, receiving a **new token**. Every ack, renewal and release is fenced by
+  the token, so a consumer that comes back late cannot delete or mutate the row
+  the new holder now owns. Its ack simply returns ``False``.
+
+Because a crashed task is redelivered, claim mode provides at-least-once
+delivery: tasks should be idempotent. The lease TTL must be longer than a task
+normally runs; renew the lease inside tasks that may run longer.
+
+When claims are released
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+The normal consumer flow manages the lease for you. A claim is released (the row
+deleted via an ack, or made claimable again) on every path except a hard crash:
+
+* **Success** - acked once the task and any pipeline/chord follow-ups finish.
+* **Retry** (a raised exception with retries left, :py:class:`RetryTask`,
+  :py:class:`TaskLockedException`, or rate-limiting) - Huey first re-enqueues a
+  fresh retry row (or schedules it when there is a delay/ETA) and then acks the
+  claimed row, so the old claim is released at re-enqueue time.
+* **Explicit cancel** (:py:class:`CancelExecution`) - with retries left it is
+  treated like a retry; with no retries left the row is acked and dropped
+  immediately.
+* **Revoked or expired before running** - acked and skipped without executing.
+* **Not ready yet** (future ETA) - moved to the schedule and the claim is
+  released without waiting for the lease to expire.
+* **SIGTERM / hard crash mid-task** - nothing is released deliberately; the row
+  stays until the lease expires and is then redelivered to another consumer.
+
+A runnable, clock-driven walk-through of contention, expiry/re-take and stale
+ack rejection lives in ``examples/sqlite_claim_demo.py``.
+
+
 Tips and tricks
 ---------------
 

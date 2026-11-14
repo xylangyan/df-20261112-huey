@@ -371,9 +371,55 @@ class Huey(object):
         return results
 
     def dequeue(self):
-        data = self.storage.dequeue()
-        if data is not None:
-            return self.deserialize_task(data)
+        result = self.storage.dequeue()
+        if result is None:
+            return
+        # Claim-mode storages return (data, lease); the lease is carried on
+        # the task so it can be confirmed, renewed or released later.
+        if isinstance(result, tuple):
+            data, lease = result
+        else:
+            data, lease = result, None
+        task = self.deserialize_task(data)
+        task._lease = lease
+        return task
+
+    def ack(self, task):
+        """
+        Confirm a claimed task, deleting its queue row. Returns ``True`` if
+        this consumer still owned the claim. A stale consumer whose lease
+        expired and was taken over gets ``False`` and must not run any
+        follow-up work (result storage, re-enqueue, pipeline, ...).
+        """
+        if task._lease is None:
+            return True
+        return self.storage.ack(task._lease)
+
+    def renew_lease(self, task, ttl=None):
+        """Extend the lease on a claimed, in-flight task."""
+        if task._lease is None:
+            return False
+        return self.storage.renew_lease(task._lease, ttl)
+
+    def release_claim(self, task):
+        """
+        Voluntarily release a claim so the row becomes immediately
+        claimable again. No-op for the historical delete-on-dequeue mode.
+        """
+        if task._lease is None:
+            return False
+        return self.storage.release_claim(task._lease)
+
+    def _finalize_claim(self, task):
+        """
+        Called once the consumer is done with a claimed task. Returns True if
+        the consumer still owns the claim; a False result means the lease
+        expired and the row was taken over, in which case the caller must skip
+        all follow-up side effects to avoid double-processing.
+        """
+        if task._lease is None:
+            return True
+        return self.ack(task)
 
     def put(self, key, data):
         return self.storage.put_data(key, self.serializer.serialize(data))
@@ -416,14 +462,17 @@ class Huey(object):
 
         if not self.ready_to_run(task, timestamp):
             self.add_schedule(task)
+            self.release_claim(task)
         elif self.is_revoked(task, timestamp, False):
             logger.warning('Task %s was revoked, not executing', task)
             self._emit(S.SIGNAL_REVOKED, task)
             self._abort_chord_member(task, SKIPPED)
+            self.ack(task)
         elif task.expires_resolved and task.expires_resolved < timestamp:
             logger.info('Task %s expired, not executing.', task)
             self._emit(S.SIGNAL_EXPIRED, task)
             self._abort_chord_member(task, SKIPPED)
+            self.ack(task)
         else:
             logger.info('Executing %s', task)
             self._emit(S.SIGNAL_EXECUTING, task)
@@ -436,6 +485,7 @@ class Huey(object):
             except CancelExecution:
                 self._emit(S.SIGNAL_CANCELED, task)
                 self._abort_chord_member(task, SKIPPED)
+                self.ack(task)
                 return
 
         start = time.monotonic()
@@ -495,6 +545,7 @@ class Huey(object):
         except KeyboardInterrupt:
             logger.warning('Received exit signal, %s did not finish.', task.id)
             self._emit(S.SIGNAL_INTERRUPTED, task)
+            self.release_claim(task)
             return
         except Exception as exc:
             logger.exception('Unhandled exception in task %s.', task.id)
@@ -502,6 +553,14 @@ class Huey(object):
             self._emit(S.SIGNAL_ERROR, task, exc)
         else:
             logger.info('%s executed in %0.3fs', task, duration)
+
+        # A consumer whose lease expired while the task was running may have
+        # lost the row to another consumer. Fence off all follow-up work in
+        # that case: acknowledging fails and we simply stop touching the row.
+        if not self._finalize_claim(task):
+            logger.warning('Task %s lease expired and was re-claimed, '
+                           'discarding late result.', task.id)
+            return
 
         # Clear the flag if this instance of the task was revoked after it
         # began executing. Expiring storages implement pop_data as a peek.
@@ -822,6 +881,8 @@ class Task(object):
         self.timeout = timeout if timeout is not None else self.default_timeout
         self.chord_config = chord_config
         self._deadline = None
+        # Set by Huey.dequeue() when the storage is running in claim mode.
+        self._lease = None
 
         self.on_complete = on_complete
         self.on_error = on_error
