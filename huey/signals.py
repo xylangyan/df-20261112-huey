@@ -17,6 +17,7 @@ SIGNAL_INTERRUPTED = 'interrupted'
 SIGNAL_ENQUEUED = 'enqueued'
 SIGNAL_TIMEOUT = 'timeout'
 SIGNAL_RATE_LIMITED = 'rate-limited'
+SIGNAL_DEAD_LETTER = 'dead-letter'
 
 
 class Signal(object):

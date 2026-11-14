@@ -1,4 +1,11 @@
+from huey.constants import TASK_PAYLOAD_V1
+from huey.constants import TASK_PAYLOAD_V2
 from huey.exceptions import HueyException
+from huey.exceptions import InvalidTaskPayload
+from huey.exceptions import UnknownTaskVersion
+from huey.registry import Envelope
+from huey.registry import Message
+from huey.registry import identify_payload_version
 from huey.tests.base import BaseTestCase
 
 
@@ -37,7 +44,11 @@ class TestRegistry(BaseTestCase):
             pass
 
         task = task_a.s('v1', 'v2', p4='v4')
-        message = self.registry.create_message(task)
+        envelope = self.registry.create_message(task)
+        self.assertIsInstance(envelope, Envelope)
+        self.assertEqual(envelope.version, TASK_PAYLOAD_V2)
+        message = envelope.message
+
         self.assertEqual(message.id, task.id)
         self.assertEqual(message.retries, 1)
         self.assertEqual(message.retry_delay, 0)
@@ -48,7 +59,7 @@ class TestRegistry(BaseTestCase):
         self.assertTrue(message.expires is None)
         self.assertTrue(message.expires_resolved is None)
 
-        task2 = self.registry.create_task(message)
+        task2 = self.registry.create_task(envelope)
         self.assertEqual(task2.id, task.id)
         self.assertEqual(task2.retries, 1)
         self.assertEqual(task2.retry_delay, 0)
@@ -59,16 +70,104 @@ class TestRegistry(BaseTestCase):
         self.assertTrue(task2.expires is None)
         self.assertTrue(task2.expires_resolved is None)
 
+    def test_payload_version_configuration(self):
+        @self.huey.task()
+        def task_a():
+            pass
+
+        # The default writer stamps the explicit version-2 envelope.
+        self.assertEqual(self.huey.payload_version, TASK_PAYLOAD_V2)
+        self.assertIsInstance(self.registry.create_message(task_a.s()),
+                              Envelope)
+
+        # A producer can be pinned to the legacy, un-versioned payload.
+        self.huey.payload_version = TASK_PAYLOAD_V1
+        legacy = self.registry.create_message(task_a.s())
+        self.assertIsInstance(legacy, Message)
+        self.assertEqual(identify_payload_version(legacy), TASK_PAYLOAD_V1)
+
+        # Switching back to the current envelope takes effect immediately.
+        self.huey.payload_version = TASK_PAYLOAD_V2
+        self.assertIsInstance(self.registry.create_message(task_a.s()),
+                              Envelope)
+
+        # Unknown writer versions are rejected up front.
+        with self.assertRaises(HueyException):
+            self.huey.payload_version = 99
+
+    def test_legacy_payload_roundtrip(self):
+        @self.huey.task()
+        def task_a(n, flag=False):
+            return (n, flag)
+
+        task = task_a.s(7, flag=True)
+
+        # Simulate a record written by an older build: a bare version-1
+        # Message with no envelope at all.
+        legacy_message = self.registry._create_message(task)
+        self.assertIsInstance(legacy_message, Message)
+        restored = self.registry.create_task(legacy_message)
+        self.assertEqual(restored.id, task.id)
+        self.assertEqual(restored.args, (7,))
+        self.assertEqual(restored.kwargs, {'flag': True})
+        self.assertEqual(restored.execute(), (7, True))
+
+    def test_nested_messages_are_not_double_enveloped(self):
+        @self.huey.task()
+        def task_a(n):
+            return n
+
+        pipeline = task_a.s(1).then(task_a, 2)
+        envelope = self.registry.create_message(pipeline)
+        self.assertIsInstance(envelope, Envelope)
+
+        # The follow-up task rides along as a bare Message inside the outer
+        # envelope, never wrapped a second time.
+        nested = envelope.message.on_complete
+        self.assertIsInstance(nested, Message)
+        self.assertNotIsInstance(nested, Envelope)
+
+        restored = self.registry.create_task(envelope)
+        self.assertEqual(restored.id, pipeline.id)
+        self.assertEqual(restored.on_complete.id,
+                         pipeline.on_complete.id)
+        self.assertEqual(restored.on_complete.args, (2,))
+
+    def test_unknown_envelope_version_rejected(self):
+        @self.huey.task()
+        def task_a():
+            pass
+
+        message = self.registry._create_message(task_a.s())
+        future = Envelope(99, message)
+        with self.assertRaises(UnknownTaskVersion) as cm:
+            self.registry.create_task(future)
+        self.assertEqual(cm.exception.version, 99)
+
+    def test_unrecognized_payload_rejected_not_guessed(self):
+        # An object that is neither an Envelope nor a Message must never be
+        # fed to a decoder optimistically.
+        for bogus in (None, 42, 'not-a-task', ('tuple', 'of', 'strings'),
+                      {'id': 'x', 'name': 'y'}):
+            with self.assertRaises(InvalidTaskPayload):
+                self.registry.unwrap_message(bogus)
+
+        # An envelope wrapping the wrong inner type is likewise rejected.
+        with self.assertRaises(InvalidTaskPayload):
+            self.registry.unwrap_message(Envelope(TASK_PAYLOAD_V2,
+                                                  ('not', 'a', 'message')))
+
     def test_user_task_kwarg_preserved(self):
         @self.huey.task()
         def task_t(**kwargs):
             return kwargs
 
         task = task_t.s(task='user-value')
-        message = self.registry.create_message(task)
+        message = self.registry.create_message(task).message
         self.assertEqual(message.kwargs, {'task': 'user-value'})
 
-        task2 = self.registry.create_task(message)
+        task2 = self.registry.create_task(
+            self.registry.create_message(task))
         self.assertEqual(task2.kwargs, {'task': 'user-value'})
         self.assertEqual(task2.execute(), {'task': 'user-value'})
 
@@ -83,7 +182,7 @@ class TestRegistry(BaseTestCase):
         # Executing a context task does not pollute its kwargs, so it can be
         # re-serialized (e.g. for retry) without leaking the task instance.
         self.assertEqual(t.kwargs, {})
-        message = self.registry.create_message(t)
+        message = self.registry.create_message(t).message
         self.assertEqual(message.kwargs, {})
 
     def test_missing_task(self):

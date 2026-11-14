@@ -127,6 +127,7 @@ Table of contents
    imports
    shared_resources
    signals
+   payload_migration
    api
    contrib
    troubleshooting

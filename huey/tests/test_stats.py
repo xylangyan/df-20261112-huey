@@ -17,6 +17,7 @@ if peewee is not None:
     from huey.contrib.stats import HueyEvent
     from huey.contrib.stats import HueyInflight
     from huey.contrib.stats import HueyStats
+    from huey.registry import DeadLetter
 
 
 @unittest.skipIf(peewee is None, 'requires peewee')
@@ -190,6 +191,26 @@ class TestStatsFlush(StatsTestCase):
         rows = dict((e.signal, e.duration) for e in HueyEvent.select())
         self.assertTrue(rows[S.SIGNAL_ERROR] is not None)
         self.assertTrue(rows[S.SIGNAL_RETRYING] is None)
+
+    def test_dead_letter_signal_recorded_without_task(self):
+        stats = self.get_stats(flush_interval=60)
+        letter = DeadLetter(
+            id='dl-1', version=99, error='UnknownTaskVersion: 99',
+            source='queue', raw=b'raw', timestamp=None)
+
+        # The dead-letter signal carries no Task (the record could not be
+        # decoded); the recorder must still persist it without error.
+        self.huey._emit(S.SIGNAL_DEAD_LETTER, None, letter)
+        stats._flush()
+
+        rows = HueyEvent.select().where(
+            HueyEvent.signal == S.SIGNAL_DEAD_LETTER)
+        self.assertEqual(rows.count(), 1)
+        row = rows[0]
+        self.assertEqual(row.task_id, 'dl-1')
+        self.assertEqual(row.task, 'dead-letter')
+        self.assertIn('UnknownTaskVersion', row.error)
+        self.assertEqual(HueyInflight.select().count(), 0)
 
 
 class TestStatsPrune(StatsTestCase):

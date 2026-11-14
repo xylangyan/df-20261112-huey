@@ -13,6 +13,8 @@ Measurements
 * :py:meth:`Huey.scheduled_count`, tasks scheduled with a future ``eta``.
 * :py:meth:`Huey.result_count`, key/value pairs in the result store (results,
   plus revoke flags and locks).
+* :py:meth:`Huey.dead_letter_count`, records that could not be decoded and
+  were quarantined instead of executed (see :ref:`payload-migration`).
 
 From signals, recorded in the consumer:
 
@@ -20,6 +22,11 @@ From signals, recorded in the consumer:
   ``SIGNAL_RETRYING``.
 * Execution duration, from ``SIGNAL_EXECUTING`` to ``SIGNAL_COMPLETE`` or
   ``SIGNAL_ERROR``, keyed on ``task.id``.
+* ``SIGNAL_DEAD_LETTER`` fires when an undecodable record is moved to the
+  dead-letter queue. Its receiver gets ``(signal, None, dead_letter)`` — the
+  second argument is ``None`` because no task could be instantiated, and the
+  :py:class:`~huey.registry.DeadLetter` carries the record id, detected
+  version, source and failure reason.
 
 The full list of signals and their ordering is in :ref:`signals`. Signals
 fire in the process that runs the task, so the recording handlers must be

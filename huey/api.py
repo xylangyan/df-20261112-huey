@@ -14,18 +14,24 @@ from functools import partial
 from functools import wraps
 
 from huey import signals as S
+from huey.constants import DEFAULT_TASK_PAYLOAD_VERSION
 from huey.constants import EmptyData
+from huey.constants import TASK_PAYLOAD_VERSION_UNKNOWN
 from huey.consumer import Consumer
 from huey.exceptions import CancelExecution
 from huey.exceptions import ConfigurationError
+from huey.exceptions import InvalidTaskPayload
 from huey.exceptions import RateLimitExceeded
 from huey.exceptions import RETRYING_EXCEPTIONS
 from huey.exceptions import ResultTimeout
 from huey.exceptions import RetryTask
 from huey.exceptions import TaskException
 from huey.exceptions import TaskLockedException
+from huey.exceptions import TaskPayloadException
 from huey.exceptions import TaskTimeout
+from huey.registry import DeadLetter
 from huey.registry import Registry
+from huey.registry import identify_payload_version
 from huey.serializer import Serializer
 from huey.storage import BlackHoleStorage
 from huey.storage import CySqliteStorage
@@ -72,6 +78,14 @@ class Huey(object):
     :param bool use_zlib: use zlib for compression instead of gzip.
     :param bool immediate_use_memory: automatically switch to a local in-memory
         storage backend when immediate-mode is enabled.
+    :param int payload_version: task payload version stamped onto newly written
+        messages. Defaults to the current explicit envelope. Set to the legacy
+        version (1) when rolling back a producer so it keeps writing records
+        that older consumers understand. Consumers always read every supported
+        version regardless of this setting.
+    :param bool dead_letter: store records that cannot be decoded (e.g. an
+        unknown payload version or corrupt bytes) in a dead-letter queue instead
+        of discarding them. Enabled by default.
     :param storage_kwargs: arbitrary keyword arguments that will be passed to
         the storage backend for additional configuration.
 
@@ -95,7 +109,9 @@ class Huey(object):
     def __init__(self, name='huey', results=True, store_none=False, utc=True,
                  immediate=False, serializer=None, compression=False,
                  use_zlib=False, immediate_use_memory=True, storage_class=None,
-                 store_intermediate_errors=True, **storage_kwargs):
+                 store_intermediate_errors=True,
+                 payload_version=DEFAULT_TASK_PAYLOAD_VERSION,
+                 dead_letter=True, **storage_kwargs):
 
         self.name = name
         self.results = results
@@ -122,10 +138,14 @@ class Huey(object):
         self._post_execute = {}
         self._startup = {}
         self._shutdown = {}
-        self._registry = Registry()
+        self._registry = Registry(payload_version=payload_version)
         self._signal = S.Signal()
         self._tasks_in_flight = set()
         self._timeout_handler = None  # This is consumer-specific.
+
+        # Dead-letter configuration for records that cannot be decoded.
+        self.dead_letter_enabled = dead_letter
+        self._dead_letter_seq = 0
 
     def get_task_wrapper_class(self):
         return TaskWrapper
@@ -164,6 +184,16 @@ class Huey(object):
             # versus normal mode, we need to recreate the storage engine.
             if self.immediate_use_memory:
                 self.storage = self.create_storage()
+
+    @property
+    def payload_version(self):
+        """Payload version stamped onto newly written task messages."""
+        return self._registry.payload_version
+
+    @payload_version.setter
+    def payload_version(self, version):
+        self._registry.payload_version = \
+            Registry.validate_payload_version(version)
 
     def create_consumer(self, **options):
         return Consumer(self, **options)
@@ -298,7 +328,11 @@ class Huey(object):
         return self.serializer.serialize(message)
 
     def deserialize_task(self, data):
-        message = self.serializer.deserialize(data)
+        try:
+            message = self.serializer.deserialize(data)
+        except Exception as exc:
+            raise InvalidTaskPayload(
+                'unable to unpickle task payload: %s' % exc, data)
         return self._registry.create_task(message)
 
     def enqueue(self, task):
@@ -371,9 +405,132 @@ class Huey(object):
         return results
 
     def dequeue(self):
+        """
+        Pop the next raw record off the queue and decode it into a Task.
+
+        Records that cannot be decoded are removed from the live queue and
+        routed to the dead-letter queue (when enabled), so a single bad record
+        never blocks subsequent, healthy records. Decoding failures never fall
+        through to an alternative encoder: an unrecognized payload version is
+        reported as such.
+        """
         data = self.storage.dequeue()
-        if data is not None:
+        if data is None:
+            return None
+        try:
             return self.deserialize_task(data)
+        except TaskPayloadException as exc:
+            self.handle_bad_message(data, exc, source='queue')
+            return None
+
+    def _dead_letter_key(self, letter_id):
+        return '%s:dlq:%s' % (self.name, letter_id)
+
+    def _identify_raw_payload(self, data):
+        """
+        Best-effort version identification for a raw, possibly corrupt record.
+        Returns the version constant/string without raising, so dead-letter
+        metadata can always be populated.
+        """
+        try:
+            obj = self.serializer.deserialize(data)
+        except Exception:
+            return TASK_PAYLOAD_VERSION_UNKNOWN
+        return identify_payload_version(obj)
+
+    def handle_bad_message(self, data, exc, source):
+        """
+        Persist an undecodable record in the dead-letter queue and emit a
+        SIGNAL_DEAD_LETTER. The original bytes are preserved verbatim, along
+        with the detected version (when determinable) and the failure reason.
+        """
+        version = getattr(exc, 'version', None)
+        if version is None:
+            version = self._identify_raw_payload(data)
+
+        self._dead_letter_seq += 1
+        letter_id = '%d-%d' % (int(time.time() * 1000), self._dead_letter_seq)
+        letter = DeadLetter(
+            id=letter_id,
+            version=version,
+            error='%s: %s' % (type(exc).__name__, exc),
+            source=source,
+            raw=data,
+            timestamp=self._get_timestamp())
+
+        if self.dead_letter_enabled:
+            self.storage.put_data(self._dead_letter_key(letter_id),
+                                  self.serializer.serialize(letter))
+            logger.error('Task payload could not be decoded, moved to '
+                         'dead-letter queue (id=%s, version=%s, source=%s): %s',
+                         letter_id, version, source, exc)
+        else:
+            logger.error('Task payload could not be decoded and dead-letter '
+                         'queue is disabled, record discarded '
+                         '(version=%s, source=%s): %s',
+                         version, source, exc)
+
+        self._emit(S.SIGNAL_DEAD_LETTER, None, letter)
+        return letter
+
+    def dead_letters(self):
+        """
+        Return all dead-letter records, ordered by identifier (which encodes
+        enqueue order). Each record is a DeadLetter namedtuple.
+        """
+        prefix = '%s:dlq:' % self.name
+        items = self.storage.result_items()
+        accum = []
+        for key, raw in sorted(items.items()):
+            if isinstance(key, bytes):
+                key = key.decode('utf8')
+            if not key.startswith(prefix):
+                continue
+            try:
+                accum.append(self.serializer.deserialize(raw))
+            except Exception:
+                logger.exception('Unable to deserialize dead-letter %s.', key)
+        return accum
+
+    def get_dead_letter(self, letter_id):
+        data = self.storage.peek_data(self._dead_letter_key(letter_id))
+        if data is EmptyData:
+            return
+        return self.serializer.deserialize(data)
+
+    def dead_letter_count(self):
+        prefix = ('%s:dlq:' % self.name).encode('utf8')
+        count = 0
+        for key in self.storage.result_items():
+            if isinstance(key, str):
+                key = key.encode('utf8')
+            if key.startswith(prefix):
+                count += 1
+        return count
+
+    def replay_dead_letter(self, letter_id):
+        """
+        Re-enqueue the raw bytes of a dead-letter record back onto the live
+        queue. Returns True when a record was found and replayed. Use this
+        after deploying a build that understands the record's version, or
+        after repairing the record manually.
+        """
+        key = self._dead_letter_key(letter_id)
+        data = self.storage.pop_data(key)
+        if data is EmptyData:
+            return False
+        self.storage.enqueue(data)
+        return True
+
+    def delete_dead_letter(self, letter_id):
+        return self.storage.delete_data(self._dead_letter_key(letter_id))
+
+    def flush_dead_letters(self):
+        prefix = '%s:dlq:' % self.name
+        for key in list(self.storage.result_items()):
+            decoded = key.decode('utf8') if isinstance(key, bytes) else key
+            if decoded.startswith(prefix):
+                self.storage.delete_data(decoded)
 
     def put(self, key, data):
         return self.storage.put_data(key, self.serializer.serialize(data))
@@ -705,13 +862,27 @@ class Huey(object):
     def read_schedule(self, timestamp=None):
         if timestamp is None:
             timestamp = self._get_timestamp()
-        return self._deserialize_all(self.storage.read_schedule(timestamp))
+        # read_schedule() destructively removes due task records from the
+        # schedule, so undecodable records are dead-lettered rather than
+        # retried forever.
+        return self._deserialize_all(self.storage.read_schedule(timestamp),
+                                     source='schedule', dead_letter=True)
 
-    def _deserialize_all(self, messages):
+    def _deserialize_all(self, messages, source='queue', dead_letter=False):
         accum = []
         for msg in messages:
             try:
                 accum.append(self.deserialize_task(msg))
+            except TaskPayloadException as exc:
+                if dead_letter:
+                    self.handle_bad_message(msg, exc, source=source)
+                else:
+                    # Non-destructive peek (pending/scheduled inspection): the
+                    # record stays in place and is dead-lettered later by the
+                    # destructive dequeue/read_schedule path.
+                    logger.error(
+                        'Unreadable task payload present in %s: %s',
+                        source, exc)
             except Exception:
                 logger.exception('Unable to deserialize task.')
         return accum
@@ -728,13 +899,15 @@ class Huey(object):
         return task.eta is None or task.eta <= timestamp
 
     def pending(self, limit=None):
-        return self._deserialize_all(self.storage.enqueued_items(limit))
+        return self._deserialize_all(self.storage.enqueued_items(limit),
+                                     source='queue', dead_letter=False)
 
     def pending_count(self):
         return self.storage.queue_size()
 
     def scheduled(self, limit=None):
-        return self._deserialize_all(self.storage.scheduled_items(limit))
+        return self._deserialize_all(self.storage.scheduled_items(limit),
+                                     source='schedule', dead_letter=False)
 
     def scheduled_count(self):
         return self.storage.schedule_size()

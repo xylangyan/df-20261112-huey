@@ -1,5 +1,16 @@
 .. _changes:
 
+Task payload versioning
+=======================
+
+Task messages now carry an explicit payload version. New records are wrapped in
+a versioned envelope (payload version 2), while consumers continue to read the
+historical un-versioned records (payload version 1) unchanged. Records that
+cannot be decoded — including envelopes stamped with an unknown version — are
+routed to a dead-letter queue instead of being discarded or passed to an
+unrelated decoder, and they no longer block the healthy records behind them.
+See :ref:`payload-migration` for the rolling-upgrade and rollback procedure.
+
 Changes in 3.0
 ==============
 

@@ -135,6 +135,21 @@ class HueyStats(object):
     def _on_signal(self, signal, task, exc=None):
         try:
             now = time.time()
+            # Dead-letter signals carry no Task instance (the record could not
+            # be decoded), so record them without task-specific fields.
+            if signal == S.SIGNAL_DEAD_LETTER:
+                letter = exc
+                row = {
+                    'ts': now, 'queue': self.name,
+                    'task_id': getattr(letter, 'id', ''),
+                    'task': 'dead-letter', 'signal': signal,
+                    'duration': None,
+                    'error': repr(getattr(letter, 'error', None))[:1000],
+                    'args': None}
+                with self._lock:
+                    self._buf.append(row)
+                return
+
             t = type(task)
             duration = None
             if signal == S.SIGNAL_EXECUTING:

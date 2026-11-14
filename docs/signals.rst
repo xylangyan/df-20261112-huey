@@ -68,6 +68,11 @@ handler beyond the standard ``(signal, task)`` pair.
      - Consumer was shut down while the task was still executing (e.g., via
        ``SIGTERM``).
      - None
+   * - ``SIGNAL_DEAD_LETTER``
+     - A record could not be decoded (unknown payload version or corrupt
+       bytes) and was moved to the dead-letter queue. The ``task`` argument is
+       ``None`` because no task could be built.
+     - ``dead_letter``: the :py:class:`~huey.registry.DeadLetter` record.
 
 Signal Ordering
 ---------------
